@@ -1,0 +1,49 @@
+{
+  "name": "pocketagent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server/index.ts",
+    "dev:web": "vite --host 127.0.0.1",
+    "protocol:generate": "node scripts/generate-protocol.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "npm run protocol:generate && tsc -p tsconfig.server.json && vite build",
+    "start": "node dist/server/src/server/index.js",
+    "pair": "tsx src/server/manage.ts pair",
+    "devices": "tsx src/server/manage.ts devices",
+    "revoke": "tsx src/server/manage.ts revoke",
+    "startup:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Install",
+    "startup:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Remove",
+    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Start",
+    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Stop",
+    "secret:check": "node scripts/secret-check.mjs"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.5",
+    "@fastify/multipart": "^10.1.8",
+    "@fastify/static": "^10.1.10",
+    "@fastify/websocket": "^11.3.7",
+    "fastify": "^5.12.8",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@openai/codex": "^0.167.0",
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.2.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.6",
+    "vitest": "^5.1.0"
+  }
+}
