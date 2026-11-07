@@ -40,6 +40,18 @@ afterEach(async () => {
 });
 
 describe('Codex stdio bridge with a synthetic child', () => {
+  it('remembers only verified project assignments from its own live thread starts and clears them on stop', async () => {
+    const bridge = await start();
+    await bridge.request('thread/start', { projectId: 'synthetic-project', cwd: '/synthetic/project' });
+    expect(bridge.createdThreadProject('fixture-created-thread')).toBe('synthetic-project');
+    expect(bridge.createdThreadIds('synthetic-project')).toEqual(['fixture-created-thread']);
+    expect(bridge.createdThreadProject('unrelated-thread')).toBeUndefined();
+    await bridge.stop();
+    expect(bridge.createdThreadIds('synthetic-project')).toEqual([]);
+    const another = await start();
+    await another.request('thread/start', { projectId: 'mismatched-project', cwd: '/synthetic/project' });
+    expect(another.createdThreadProject('fixture-created-thread')).toBeUndefined();
+  });
   it('starts a CLI path containing spaces and Unicode without a shell', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'pocketagent-codex-test-模擬 cli '));
     directories.push(directory);

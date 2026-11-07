@@ -34,6 +34,9 @@ lines.on('line', line => {
       break;
     case 'initialized':
       break;
+    case 'thread/start':
+      respond(id, { thread: { id: 'fixture-created-thread', projectId: params.projectId === 'mismatched-project' ? 'other-project' : params.projectId, cwd: params.cwd, status: { type: 'idle' }, turns: [] } });
+      break;
     case 'account/read':
       if (process.argv.includes('--fixture-crash-account-read')) process.exit(18);
       respond(id, { account: { type: 'chatgpt', email: 'fixture@example.invalid' } });

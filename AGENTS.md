@@ -9,6 +9,8 @@ PocketAgent is a private, self-hosted mobile web interface to the local Codex CL
 - Default to workspace-write and interactive approvals. Never silently weaken account or workspace policies.
 - Private network mode binds separate loopback, physical RFC1918 LAN and Tailscale listeners sharing one Codex bridge and store. Keep Host/Origin validation specific to each listener; never broaden this into wildcard or public-address binding.
 - Device pairing defaults ON for new installations. An explicit user choice may turn pairing OFF; persist that choice only in external runtime state, retain device records, and keep private binding and Host/Origin checks enforced in both modes.
+- A new paginated thread can omit its project in thread/read before its first turn persists. Only the current bridge's verified thread/start assignment may fill that temporary gap; explicit conflicting projects, unrelated unassigned threads and escaped roots must still be rejected. Clear transient assignments when canonical metadata is available or the bridge disconnects.
+- Populate reasoning choices from model/list and send explicit selections through turn/start effort. Resuming a conversation must preserve its existing effort unless the user changes it.
 
 ## Privacy boundary
 - All runtime state belongs outside the checkout under the user's LOCALAPPDATA/PocketAgent directory (or an explicitly configured external data directory).

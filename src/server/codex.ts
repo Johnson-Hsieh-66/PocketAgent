@@ -16,7 +16,7 @@ export interface SubmissionLedger {
 export class CodexRpcError extends Error {
   constructor(message: 'CODEX_RPC_ERROR' | 'THREAD_WRITER_CONFLICT', public readonly rpcCode?: number) { super(message); this.name = 'CodexRpcError'; }
 }
-type RpcPending = { method: string; startedAt: number; resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
+type RpcPending = { method: string; createdProjectId?: string; startedAt: number; resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 export class CodexBridge extends EventEmitter {
   status: ServiceStatus = { codex: 'offline' };
   private child?: ChildProcessWithoutNullStreams;
@@ -27,8 +27,11 @@ export class CodexBridge extends EventEmitter {
   private requests = new Map<string, PendingRequest>();
   private active = new Map<string, string>();
   private sends = new Map<string, { threadId: string; fingerprint: string; result: Promise<any> }>();
+  private createdProjects = new Map<string, string>();
   private stopping = false;
   get pendingRequests() { return [...this.requests.values()]; }
+  createdThreadProject(threadId: string) { return this.createdProjects.get(threadId); }
+  createdThreadIds(projectId: string) { return [...this.createdProjects].filter(([, id]) => id === projectId).map(([id]) => id); }
   constructor(private executable: CodexCommand, private ledger?: SubmissionLedger, private diagnostic?: DiagnosticSink) { super(); }
   private report(entry: Omit<DiagnosticInput, 'component'>) {
     try { this.diagnostic?.(sanitizeDiagnostic({ component: 'codex', ...entry })); } catch { /* Diagnostics never affect agent work. */ }
@@ -80,7 +83,7 @@ export class CodexBridge extends EventEmitter {
     for (const p of this.rpc.values()) { clearTimeout(p.timer); p.reject(new Error(code)); }
     this.rpc.clear();
     for (const [threadId, turnId] of this.active) this.publish('pocketagent/interrupted', { threadId, turnId, code });
-    this.active.clear(); this.requests.clear();
+    this.active.clear(); this.requests.clear(); this.createdProjects.clear();
     this.publish('pocketagent/requests', { requests: [] });
     this.setStatus({ codex: 'offline', error: code });
   }
@@ -94,7 +97,7 @@ export class CodexBridge extends EventEmitter {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.rpc.delete(id); this.report({ code: 'CODEX_REQUEST_TIMEOUT', operation: method, durationMs: Math.round(performance.now() - startedAt) }); reject(new Error('CODEX_REQUEST_TIMEOUT')); }, 45_000);
       timer.unref();
-      this.rpc.set(id, { method, startedAt, resolve, reject, timer });
+      this.rpc.set(id, { method, createdProjectId: method === 'thread/start' && typeof params.projectId === 'string' ? params.projectId : undefined, startedAt, resolve, reject, timer });
       try { this.write({ id, method, params }); } catch (error) {
         clearTimeout(timer); this.rpc.delete(id);
         this.report({ code: error instanceof Error && error.message === 'CODEX_OFFLINE' ? 'CODEX_OFFLINE' : 'CODEX_RPC_WRITE_FAILED', operation: method, durationMs: Math.round(performance.now() - startedAt) });
@@ -123,12 +126,19 @@ export class CodexBridge extends EventEmitter {
             this.active.set(thread.id, running?.id ?? 'external-active');
           } else if (thread?.id && thread.status?.type !== 'active' && this.active.get(thread.id) === 'external-active') this.active.delete(thread.id);
         }
+        const created = message.result?.thread;
+        if (pending.method === 'thread/start' && pending.createdProjectId && typeof created?.id === 'string' && created.projectId === pending.createdProjectId) {
+          if (this.createdProjects.size >= 1000) this.createdProjects.delete(this.createdProjects.keys().next().value!);
+          this.createdProjects.set(created.id, pending.createdProjectId);
+        }
+        if (pending.method === 'thread/read' && created?.projectId && this.createdProjects.get(created.id) === created.projectId) this.createdProjects.delete(created.id);
         pending.resolve(message.result);
       }
       return;
     }
     if (typeof message.method !== 'string') return;
     const params = message.params ?? {};
+    if (message.method === 'thread/closed') this.createdProjects.delete(params.threadId);
     if (message.id !== undefined) {
       this.requests.set(String(message.id), { id: message.id, method: message.method, params });
       this.publish('pocketagent/requests', { requests: this.pendingRequests });

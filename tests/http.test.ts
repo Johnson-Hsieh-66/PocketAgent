@@ -18,15 +18,19 @@ class FakeBridge extends EventEmitter {
   history: AppEvent[] = [];
   cwd = '';
   response = vi.fn();
+  created = new Map<string, string>();
+  createdThreadProject(id: string) { return this.created.get(id); }
+  createdThreadIds(projectId: string) { return [...this.created].filter(([, id]) => id === projectId).map(([id]) => id); }
   startTurn = vi.fn(async (_id: string, _params: unknown, _requestId: string) => ({ turn: { id: 'synthetic-turn', status: 'inProgress', items: [] } }));
   interrupt = vi.fn(async () => ({}));
   eventsSince(after: number) { return { events: this.history.filter(event => event.seq > after), reset: after > 100 }; }
   respond(id: string | number, result: unknown) { this.response(id, result); }
   request = vi.fn<(method: string, params: any) => Promise<any>>(async (method: string, params: any) => {
-    if (method === 'thread/read') return { thread: { id: params.threadId, projectId: 'synthetic-desktop-project', cwd: this.cwd, preview: 'Synthetic', turns: [] } };
+    if (method === 'thread/start') { this.created.set('synthetic-new-thread', params.projectId); return { thread: { id: 'synthetic-new-thread', projectId: params.projectId, cwd: this.cwd, preview: '', turns: [] } }; }
+    if (method === 'thread/read') return { thread: { id: params.threadId, projectId: params.threadId === 'synthetic-new-thread' ? null : 'synthetic-desktop-project', cwd: this.cwd, model: 'synthetic-model', preview: 'Synthetic', turns: [] } };
     if (method === 'thread/list') return { data: [{ id: 'synthetic-thread', projectId: 'synthetic-desktop-project', cwd: this.cwd, preview: 'Synthetic' }], nextCursor: 'next-synthetic-page' };
     if (method === 'thread/turns/list') return { data: [{ id: 'synthetic-turn', items: [], status: 'completed' }], nextCursor: null };
-    if (method === 'model/list') return { data: [{ id: 'synthetic-model', model: 'synthetic-model', displayName: 'Synthetic' }] };
+    if (method === 'model/list') return { data: [{ id: 'synthetic-model', model: 'synthetic-model', displayName: 'Synthetic', isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: ['low', 'medium', 'high'].map(reasoningEffort => ({ reasoningEffort, description: 'Synthetic effort' })) }] };
     return {};
   });
 }
@@ -304,6 +308,31 @@ describe('private HTTP boundary and project access', () => {
     const history = await app.inject({ url: `/api/threads/synthetic-thread/turns?projectId=${projectId}`, headers: { ...headers, cookie } });
     expect(history.statusCode).toBe(200);
     expect(history.json().data).toHaveLength(1);
+    expect(bridge.startTurn).not.toHaveBeenCalled();
+  });
+  it('sends the first message of a verified new thread before its project assignment is persisted, including reasoning effort', async () => {
+    const created = await app.inject({ method: 'POST', url: '/api/threads', headers: { ...headers, cookie }, payload: { projectId, model: 'synthetic-model', effort: 'high' } });
+    expect(created.statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/start', expect.objectContaining({ projectId, config: { model_reasoning_effort: 'high' } }));
+    const sent = await app.inject({ method: 'POST', url: '/api/threads/synthetic-new-thread/messages', headers: { ...headers, cookie }, payload: { projectId, text: 'Synthetic first message', effort: 'high', requestId: 'synthetic-new-request' } });
+    expect(sent.statusCode).toBe(200);
+    expect(bridge.startTurn).toHaveBeenCalledWith('synthetic-new-thread', expect.objectContaining({ effort: 'high', input: [expect.objectContaining({ text: 'Synthetic first message' })] }), 'synthetic-new-request');
+    const listed = await app.inject({ url: `/api/threads?projectId=${projectId}`, headers: { ...headers, cookie } });
+    expect(listed.json().data.some((thread: any) => thread.id === 'synthetic-new-thread')).toBe(true);
+    const implementation = bridge.request.getMockImplementation()!;
+    bridge.request.mockImplementation(async (method, params) => method === 'thread/read' ? { thread: { id: params.threadId, projectId: 'other-project', cwd: bridge.cwd } } : implementation(method, params));
+    expect((await app.inject({ url: `/api/threads/synthetic-new-thread?projectId=${projectId}`, headers: { ...headers, cookie } })).statusCode).toBe(403);
+    bridge.request.mockImplementation(async (method, params) => method === 'thread/read' ? { thread: { id: params.threadId, projectId: null, cwd: bridge.cwd } } : implementation(method, params));
+    expect((await app.inject({ url: `/api/threads/unrelated-thread?projectId=${projectId}`, headers: { ...headers, cookie } })).statusCode).toBe(403);
+    bridge.cwd = temp;
+    expect((await app.inject({ url: `/api/threads/synthetic-new-thread?projectId=${projectId}`, headers: { ...headers, cookie } })).statusCode).toBe(403);
+  });
+  it('rejects unsupported reasoning effort before creating a thread or dispatching a turn', async () => {
+    for (const effort of ['unsupported', false, 5]) {
+      expect((await app.inject({ method: 'POST', url: '/api/threads', headers: { ...headers, cookie }, payload: { projectId, effort } })).statusCode).toBe(400);
+      expect((await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/messages', headers: { ...headers, cookie }, payload: { projectId, text: 'Synthetic', effort, requestId: 'synthetic-bad-effort' } })).statusCode).toBe(400);
+    }
+    expect(bridge.request.mock.calls.some(([method]) => method === 'thread/start')).toBe(false);
     expect(bridge.startTurn).not.toHaveBeenCalled();
   });
   it('reuses original desktop thread identities and merges only assigned legacy history on the first page', async () => {

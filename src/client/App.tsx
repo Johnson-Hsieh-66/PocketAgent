@@ -57,6 +57,8 @@ const errorMessages: Record<string, string> = {
   THREAD_RESUME_FAILED: '已載入可讀取的對話紀錄，但目前無法接續。請重新選取這個對話再試一次。',
   THREAD_WRITER_CONFLICT: '這個對話目前由其他 Codex 客戶端開啟，暫時只能檢視；原客戶端釋放後，再重新選取以接續。',
   INVALID_ATTACHMENTS: '每則訊息最多附加 8 張圖片。',
+  UNSUPPORTED_REASONING_EFFORT: '目前模型不支援這個思考強度，請重新選擇。',
+  THREAD_NOT_IN_PROJECT: '對話的專案歸屬不符，請重新選取專案與對話。',
   REQUEST_ID_CONFLICT: '這則訊息與先前送出的內容不一致。請確認內容並編輯後重新傳送。',
   PAIRING_CODE_INVALID_OR_EXPIRED: '配對碼無效或已過期。請在電腦執行 npm run pair 取得新碼。',
   PAIRING_CODE_FORMAT_INVALID: '配對碼必須是 8 位數字，請確認後再試一次。',
@@ -90,6 +92,11 @@ export function ModelOptions({ models, model }: { models: Model[]; model: string
     {!model ? <option value="">{models.length ? '沿用對話模型' : '預設模型'}</option> : null}
     {models.map(entry => <option value={entry.model} key={entry.id}>{entry.displayName || entry.model}</option>)}
   </>;
+}
+
+const effortLabel = (effort: string) => ({ none: '關閉', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '非常高', max: '最高', ultra: 'Ultra' }[effort] || effort);
+export function ReasoningOptions({ model, inherited }: { model?: Model; inherited: string }) {
+  return <><option value="">沿用設定{inherited ? `（${effortLabel(inherited)}）` : ''}</option>{model?.supportedReasoningEfforts?.map(option => <option key={option.reasoningEffort} value={option.reasoningEffort} title={option.description}>{effortLabel(option.reasoningEffort)}</option>)}</>;
 }
 
 const terminalStatus = (status: string) => ['completed', 'failed', 'interrupted'].includes(status);
@@ -282,6 +289,8 @@ export function App() {
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [model, setModel] = useState('');
+  const [effort, setEffort] = useState('');
+  const [inheritedEffort, setInheritedEffort] = useState('');
   const [status, setStatus] = useState<ServiceStatus>({ codex: 'starting' });
   const [requests, setRequests] = useState<PendingRequest[]>([]);
   const [connection, setConnection] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
@@ -314,6 +323,7 @@ export function App() {
   const accessStateRef = useRef<AuthState>({ authenticated: false, pairingRequired: true, paired: false });
   const project = projects.find((entry) => entry.id === projectId);
   const selectedThread = threads.find((entry) => entry.id === threadId);
+  const selectedModel = models.find(entry => entry.model === model);
   const isWorking = turns.some((turn) => ['inProgress', 'running', 'active'].includes(turn.status)) || selectedThread?.status?.type === 'active';
   const currentRequests = requests.filter((request) => string(request.params.threadId) === threadId || (!request.params.threadId && !!threadId));
   const itemCount = turns.reduce((count, turn) => count + turn.items.length, 0);
@@ -405,7 +415,7 @@ export function App() {
     if (projectViewRef.current !== projectId) {
       projectViewRef.current = projectId;
       viewEpochRef.current += 1;
-      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false); setContinuationReady(true);
+      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false); setContinuationReady(true); setInheritedEffort('');
     }
     setLoading(true);
     if (!projectId) { setLoading(false); return; }
@@ -517,11 +527,12 @@ export function App() {
     const epoch = ++viewEpochRef.current;
     const selectedProject = projectId;
     const isCurrentView = () => epoch === viewEpochRef.current && threadRef.current === entry.id && projectRef.current === selectedProject;
-    setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); setLoading(true); setContinuationReady(false); setModel(''); setError(''); setAttachments([]); followRef.current = true;
+    setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); setLoading(true); setContinuationReady(false); setModel(entry.model || ''); setEffort(''); setInheritedEffort(entry.reasoningEffort || ''); setError(''); setAttachments([]); followRef.current = true;
     const history = refreshHistory(entry.id, selectedProject);
-    const resume = api<{ thread: Thread; model?: string }>(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId: selectedProject }) }).then(resumed => {
+    const resume = api<{ thread: Thread; model?: string; reasoningEffort?: string | null }>(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId: selectedProject }) }).then(resumed => {
       if (!isCurrentView()) return;
       setModel(typeof resumed.model === 'string' ? resumed.model : '');
+      setInheritedEffort(resumed.reasoningEffort || entry.reasoningEffort || '');
       setContinuationReady(true);
     });
     const [historyResult, resumeResult] = await Promise.allSettled([history, resume]);
@@ -534,7 +545,7 @@ export function App() {
     setLoading(false);
     await refreshRequests();
   };
-  const newThread = () => { viewEpochRef.current += 1; setLoading(false); setContinuationReady(true); setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
+  const newThread = () => { viewEpochRef.current += 1; const previous = effort || inheritedEffort; setEffort(selectedModel?.supportedReasoningEfforts?.some(option => option.reasoningEffort === previous) ? previous : selectedModel?.defaultReasoningEffort || ''); setInheritedEffort(''); setLoading(false); setContinuationReady(true); setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
   const send = async () => {
     if ((!text.trim() && !attachments.length) || sending || loading || !continuationReady || isWorking || !projectId || status.codex !== 'ready' || status.authenticated === false) return;
     const epoch = viewEpochRef.current;
@@ -546,13 +557,13 @@ export function App() {
     let id = threadId;
     try {
       if (!id) {
-        const data = await api<{ thread: Thread }>('/threads', { method: 'POST', body: body({ projectId: sendProject, model: model || undefined }) });
+        const data = await api<{ thread: Thread }>('/threads', { method: 'POST', body: body({ projectId: sendProject, model: model || undefined, effort: effort || undefined }) });
         if (!isCurrentView()) return;
         id = data.thread.id; threadRef.current = id; setThreadId(id); setThreads((previous) => [data.thread, ...previous.filter((entry) => entry.id !== id)]);
       }
-      const fingerprint = JSON.stringify({ id, text: sentText, attachmentIds: sentAttachments, model });
+      const fingerprint = JSON.stringify({ id, text: sentText, attachmentIds: sentAttachments, model, effort });
       if (submissionRef.current?.fingerprint !== fingerprint) submissionRef.current = { fingerprint, requestId: uniqueId() };
-      const data = await api<{ turn: Turn }>(`/threads/${encodeURIComponent(id)}/messages`, { method: 'POST', body: body({ projectId: sendProject, text: sentText, attachmentIds: sentAttachments, model: model || undefined, requestId: submissionRef.current.requestId }) });
+      const data = await api<{ turn: Turn }>(`/threads/${encodeURIComponent(id)}/messages`, { method: 'POST', body: body({ projectId: sendProject, text: sentText, attachmentIds: sentAttachments, model: model || undefined, effort: effort || undefined, requestId: submissionRef.current.requestId }) });
       if (isCurrentView() && threadRef.current === id) {
         if (data.turn) setTurns((previous) => mergeTurn(previous, data.turn));
         setText((current) => current === sentText ? '' : current);
@@ -637,7 +648,7 @@ export function App() {
         <div className="composer-area">{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="關閉錯誤訊息" onClick={() => setError('')}><Icon name="close" size={15} /></button></div> : null}<form className={`composer ${sending ? 'busy' : ''}`} onSubmit={(event) => { event.preventDefault(); void send(); }}>
           {attachments.length ? <div className="attachment-list">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}><img src={`/api/uploads/${encodeURIComponent(attachment.id)}`} alt={attachment.name} /><span>{attachment.name}</span><button type="button" className="icon-button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((previous) => previous.filter((entry) => entry.id !== attachment.id))}><Icon name="close" size={13} /></button></div>)}</div> : null}
           <textarea ref={composerRef} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !window.matchMedia('(pointer: coarse)').matches) { event.preventDefault(); void send(); } }} onPaste={(event) => { const imageFiles = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/')); if (imageFiles.length) { event.preventDefault(); void upload(imageFiles); } }} placeholder={isWorking ? '工作進行中，完成後可傳送下一則訊息…' : '交代下一步，或附上一張圖片…'} aria-label="傳送給 Codex 的訊息" rows={2} disabled={!projectId} />
-          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => setModel(event.target.value)} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || loading || !continuationReady || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />工作區寫入 · 需要時核准</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
+          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => { const next = models.find(entry => entry.model === event.target.value); setModel(event.target.value); setEffort(next?.defaultReasoningEffort || ""); setInheritedEffort(""); }} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div><div className="reasoning-picker"><span>思考</span><select aria-label="思考強度" value={effort} onChange={event => setEffort(event.target.value)} disabled={isWorking || sending || loading || !selectedModel?.supportedReasoningEfforts?.length}><ReasoningOptions model={selectedModel} inherited={inheritedEffort} /></select></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || loading || !continuationReady || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />工作區寫入 · 需要時核准</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
       </div>{filesOpen && project ? <FileBrowser key={project.id} project={project} onClose={() => setFilesOpen(false)} /> : null}</div>
     </main>
     {renaming ? <div className="modal-backdrop" onClick={() => setRenaming(false)}><form className="rename-modal" onClick={(event) => event.stopPropagation()} onSubmit={(event) => void rename(event)}><h2>重新命名對話</h2><label htmlFor="thread-name">對話名稱</label><input id="thread-name" value={renameValue} onChange={(event) => setRenameValue(event.target.value)} maxLength={100} autoFocus required /><div><button type="button" className="button subtle" onClick={() => setRenaming(false)}>取消</button><button className="button accent" disabled={!renameValue.trim()}>儲存名稱</button></div></form></div> : null}

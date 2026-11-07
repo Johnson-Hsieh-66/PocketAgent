@@ -56,6 +56,11 @@ describe('conversation UI recovery with synthetic Codex responses', () => {
     await settle();
   };
   const sendButton = () => container.querySelector<HTMLButtonElement>('button[aria-label="傳送訊息"]')!;
+  const select = async (label: string, value: string) => {
+    await act(async () => { const element = container.querySelector<HTMLSelectElement>(`select[aria-label="${label}"]`)!; element.value = value; element.dispatchEvent(new Event('change', { bubbles: true })); });
+    await settle();
+  };
+  const submit = async () => { await act(async () => { container.querySelector('form.composer')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); }); await settle(); };
   const chooseFiles = async (count: number) => {
     const input = container.querySelector<HTMLInputElement>('input[type="file"]')!;
     Object.defineProperty(input, 'files', { configurable: true, value: Array.from({ length: count }, (_, index) => new File(['synthetic image'], `synthetic-${index}.png`, { type: 'image/png' })) });
@@ -67,17 +72,20 @@ describe('conversation UI recovery with synthetic Codex responses', () => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     vi.stubGlobal('WebSocket', QuietSocket);
     HTMLElement.prototype.scrollIntoView = vi.fn();
-    resumeHandler = () => json({ thread, model: 'synthetic-resumed-model' });
+    resumeHandler = () => json({ thread, model: 'synthetic-resumed-model', reasoningEffort: 'high' });
     historyHandler = () => json(history);
     let uploadSequence = 0;
     uploadHandler = () => json({ id: `synthetic-attachment-${++uploadSequence}`, name: 'synthetic.png', mime: 'image/png', size: 20 });
-    fetchMock = vi.fn(async (input: string) => {
+    let created: typeof thread | undefined;
+    fetchMock = vi.fn(async (input: string, options?: RequestInit) => {
       if (input === '/api/auth') return json({ authenticated: true, pairingRequired: false, paired: false });
       if (input === '/api/status') return json({ codex: 'ready', authenticated: true });
       if (input === '/api/projects') return json({ projects: [project] });
-      if (input === '/api/models') return json({ data: [{ id: 'synthetic-default-model', model: 'synthetic-default-model', displayName: 'Synthetic default', isDefault: true }] });
+      if (input === '/api/models') return json({ data: [{ id: 'synthetic-default-model', model: 'synthetic-default-model', displayName: 'Synthetic default', isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: ['low', 'medium', 'high'].map(reasoningEffort => ({ reasoningEffort, description: 'Synthetic effort' })) }, { id: 'synthetic-fast-model', model: 'synthetic-fast-model', displayName: 'Synthetic fast', defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Synthetic fast effort' }] }] });
       if (input === '/api/requests') return json({ requests: [] });
-      if (input.startsWith('/api/threads?')) return json({ data: [thread], nextCursor: null });
+      if (input.startsWith('/api/threads?')) return json({ data: [...(created ? [created] : []), thread], nextCursor: null });
+      if (input === '/api/threads' && options?.method === 'POST') { created = { ...thread, id: 'synthetic-created-thread', name: '', preview: '' }; return json({ thread: created }); }
+      if (input.endsWith('/messages')) { const data = JSON.parse(String(options?.body)); return json({ turn: { id: 'synthetic-sent-turn', status: 'completed', items: [{ id: 'synthetic-user-message', type: 'userMessage', content: [{ type: 'text', text: data.text }] }] } }); }
       if (input.startsWith('/api/threads/synthetic-thread/turns?')) return historyHandler();
       if (input === '/api/threads/synthetic-thread/resume') return resumeHandler();
       if (input.startsWith('/api/uploads?')) return uploadHandler();
@@ -136,6 +144,32 @@ describe('conversation UI recovery with synthetic Codex responses', () => {
     await chooseFiles(9);
     expect(container.textContent).toContain('每則訊息最多附加 8 張圖片');
     expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith('/api/uploads?'))).toBe(false);
+  });
+  it('creates a new conversation and sends its first message with the chosen reasoning effort', async () => {
+    await click(button('新增對話'));
+    await select('思考強度', 'high');
+    await draft('Synthetic first message');
+    await submit();
+    const start = fetchMock.mock.calls.find(([url]) => url === '/api/threads')!;
+    const sent = fetchMock.mock.calls.find(([url]) => url === '/api/threads/synthetic-created-thread/messages')!;
+    expect(JSON.parse(String(start[1]?.body))).toMatchObject({ projectId: project.id, effort: 'high' });
+    expect(JSON.parse(String(sent[1]?.body))).toMatchObject({ projectId: project.id, text: 'Synthetic first message', effort: 'high' });
+    expect(container.querySelector('.user-message .user-bubble')?.textContent).toBe('Synthetic first message');
+    expect(container.querySelector('textarea')!.value).toBe('');
+  });
+  it('uses each model\'s supported efforts and preserves inherited effort when resuming', async () => {
+    await select('思考強度', 'high');
+    await select('選擇模型', 'synthetic-fast-model');
+    const picker = container.querySelector<HTMLSelectElement>('select[aria-label="思考強度"]')!;
+    expect(picker.value).toBe('low');
+    expect([...picker.options].some(option => option.value === 'high')).toBe(false);
+    await click(button(thread.name));
+    expect(picker.value).toBe('');
+    expect(picker.selectedOptions[0].textContent).toContain('高');
+    await draft('Synthetic resumed message');
+    await submit();
+    const sent = fetchMock.mock.calls.find(([url]) => url === '/api/threads/synthetic-thread/messages')!;
+    expect(JSON.parse(String(sent[1]?.body))).not.toHaveProperty('effort');
   });
 
   it('keeps writer-conflicted conversations readable and explains the owning-client restriction without sending work', async () => {

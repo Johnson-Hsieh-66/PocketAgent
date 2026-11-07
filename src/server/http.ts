@@ -22,6 +22,8 @@ export interface HttpBridge {
   respond(id: string | number, result: any): void;
   startTurn(threadId: string, params: any, requestId: string): Promise<any>;
   interrupt(threadId: string): Promise<any>;
+  createdThreadProject?(threadId: string): string | undefined;
+  createdThreadIds?(projectId: string): string[];
 }
 interface AppOptions { config: AppConfig; store: Store; bridge: HttpBridge; files: Files; diagnostic?: DiagnosticSink }
 type ObjectValue = Record<string, unknown>;
@@ -102,12 +104,24 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
   app.get('/api/projects/:id/file', async request => files.read(string(params(request).id), string(query(request).path, 4000)));
   app.get('/api/models', async () => bridge.request('model/list', { limit: 100 }));
 
+  async function reasoningEffort(value: unknown, model?: unknown): Promise<string | undefined> {
+    if (value === undefined) return undefined;
+    const effort = string(value, 64);
+    const catalog = await bridge.request('model/list', { limit: 100 });
+    const selected = catalog.data?.find((entry: any) => model ? entry.model === model || entry.id === model : entry.isDefault);
+    if (!selected?.supportedReasoningEfforts?.some((option: any) => option.reasoningEffort === effort)) throw new HttpError(400, 'UNSUPPORTED_REASONING_EFFORT');
+    return effort;
+  }
+
   async function checkedThread(threadId: string, projectId: string): Promise<any> {
     await files.project(projectId);
     const response = await bridge.request('thread/read', { threadId, includeTurns: false });
     if (!response?.thread || response.thread.id !== threadId || typeof response.thread.cwd !== 'string') throw new HttpError(404, 'THREAD_NOT_FOUND');
     const assigned = response.thread.projectId;
-    if (assigned !== projectId && (assigned || !(await files.threadIds(projectId)).includes(threadId))) throw new HttpError(403, 'THREAD_NOT_IN_PROJECT');
+    // A newly started paginated thread can omit its project in thread/read until
+    // its first turn is persisted. Trust only this live bridge's verified start
+    // response, never an arbitrary unassigned thread sharing the same directory.
+    if (assigned !== projectId && (assigned != null || (bridge.createdThreadProject?.(threadId) !== projectId && !(await files.threadIds(projectId)).includes(threadId)))) throw new HttpError(403, 'THREAD_NOT_IN_PROJECT');
     await files.assertThread(projectId, response.thread.cwd);
     return response.thread;
   }
@@ -115,7 +129,7 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
   app.get('/api/threads', async request => {
     const projectId = string(query(request).projectId);
     await files.project(projectId);
-    const legacyIds = await files.threadIds(projectId);
+    const legacyIds = [...new Set([...(await files.threadIds(projectId)), ...(bridge.createdThreadIds?.(projectId) || [])])];
     const cursor = query(request).cursor;
     const response = await bridge.request('thread/list', { projectId, sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'], modelProviders: [], sortKey: 'updated_at', limit: 40, ...(cursor ? { cursor: string(cursor) } : {}) });
     const data: any[] = [];
@@ -135,7 +149,9 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     const body = object(request.body);
     const project = await files.project(string(body.projectId));
     if (!project.path) throw new HttpError(400, 'PROJECT_HAS_NO_LOCAL_ROOTS');
-    return bridge.request('thread/start', { projectId: project.id, cwd: project.path, approvalPolicy: 'on-request', sandbox: 'workspace-write', ...(body.model ? { model: string(body.model) } : {}) });
+    const model = body.model === undefined ? undefined : string(body.model);
+    const effort = await reasoningEffort(body.effort, model);
+    return bridge.request('thread/start', { projectId: project.id, cwd: project.path, approvalPolicy: 'on-request', sandbox: 'workspace-write', ...(model ? { model } : {}), ...(effort ? { config: { model_reasoning_effort: effort } } : {}) });
   });
   app.get('/api/threads/:id', async request => ({ thread: await checkedThread(string(params(request).id), string(query(request).projectId)) }));
   app.get('/api/threads/:id/turns', async request => {
@@ -161,7 +177,9 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     const body = object(request.body);
     const projectId = string(body.projectId);
     const threadId = string(params(request).id);
-    await checkedThread(threadId, projectId);
+    const thread = await checkedThread(threadId, projectId);
+    const model = body.model === undefined ? undefined : string(body.model);
+    const effort = await reasoningEffort(body.effort, model || thread.model);
     const text = body.text === undefined ? '' : typeof body.text === 'string' && body.text.length <= 100_000 ? body.text : string(body.text, 100_000);
     const attachmentIds = body.attachmentIds === undefined ? [] : body.attachmentIds;
     if (!Array.isArray(attachmentIds) || attachmentIds.length > 8 || new Set(attachmentIds).size !== attachmentIds.length) throw new HttpError(400, 'INVALID_ATTACHMENTS');
@@ -173,7 +191,7 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     if (!input.length) throw new HttpError(400, 'MESSAGE_REQUIRED');
     const requestId = string(body.requestId, 128);
     if (requestId.length < 8) throw new HttpError(400, 'INVALID_REQUEST_ID');
-    return bridge.startTurn(threadId, { input, ...(body.model ? { model: string(body.model) } : {}) }, requestId);
+    return bridge.startTurn(threadId, { input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) }, requestId);
   });
   app.post('/api/threads/:id/interrupt', async request => {
     const body = object(request.body);
