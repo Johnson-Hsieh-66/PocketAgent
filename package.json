@@ -15,6 +15,7 @@
     "build": "npm run protocol:generate && tsc -p tsconfig.server.json && vite build",
     "start": "node dist/server/src/server/index.js",
     "pair": "tsx src/server/manage.ts pair",
+    "pairing": "tsx src/server/manage.ts pairing",
     "devices": "tsx src/server/manage.ts devices",
     "revoke": "tsx src/server/manage.ts revoke",
     "startup:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Install",

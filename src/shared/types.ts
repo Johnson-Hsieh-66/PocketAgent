@@ -8,3 +8,4 @@ export interface PendingRequest { id: string | number; method: string; params: R
 export interface AppEvent { seq: number; method: string; params: Record<string, unknown> }
 export interface Attachment { id: string; name: string; mime: string; size: number }
 export interface ServiceStatus { codex: 'starting' | 'ready' | 'offline'; authenticated?: boolean; version?: string; error?: string }
+export interface AuthState { authenticated: boolean; pairingRequired: boolean; paired: boolean }

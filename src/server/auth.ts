@@ -2,7 +2,7 @@ import type { FastifyRequest } from 'fastify';
 import type { AppConfig } from './config.js';
 import { HttpError } from './files.js';
 import { Store, type Device } from './store.js';
-import type { PendingRequest } from '../shared/types.js';
+import type { AuthState, PendingRequest } from '../shared/types.js';
 
 export const COOKIE_NAME = 'pa_session';
 export const COOKIE_OPTIONS = { path: '/', httpOnly: true, sameSite: 'strict' as const, secure: false, maxAge: 30 * 24 * 60 * 60 };
@@ -27,6 +27,15 @@ export function checkBoundary(request: FastifyRequest, config: AppConfig): void 
 
 export function authenticate(request: FastifyRequest, store: Store): Device | null {
   return store.authenticate(request.cookies[COOKIE_NAME]);
+}
+
+export function accessState(request: FastifyRequest, store: Store): AuthState {
+  const paired = !!authenticate(request, store);
+  const pairingRequired = store.pairingRequired();
+  return { authenticated: !pairingRequired || paired, pairingRequired, paired };
+}
+export function tokenAuthorized(token: string | undefined, store: Store): boolean {
+  return !store.pairingRequired() || !!store.authenticate(token);
 }
 
 function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === 'object' && !Array.isArray(value); }

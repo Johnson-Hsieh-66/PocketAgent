@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { AppEvent, Attachment, FileEntry, Model, PendingRequest, Project, ServiceStatus, Thread, ThreadItem, Turn } from '../shared/types';
+import type { AppEvent, Attachment, AuthState, FileEntry, Model, PendingRequest, Project, ServiceStatus, Thread, ThreadItem, Turn } from '../shared/types';
 
 type Json = Record<string, unknown>;
 type IconName = 'plus' | 'chat' | 'folder' | 'file' | 'arrow' | 'chevron' | 'close' | 'menu' | 'image' | 'stop' | 'check' | 'shield' | 'logout' | 'terminal' | 'edit' | 'refresh' | 'back' | 'code' | 'link' | 'dots';
@@ -41,7 +41,10 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const response = await fetch(`/api${path}`, { ...options, headers, credentials: 'same-origin' });
   const data = await response.json().catch(() => ({})) as Json;
-  if (!response.ok) throw new Error(typeof data.message === 'string' ? data.message : typeof data.error === 'string' ? data.error : `連線失敗（${response.status}）`);
+  if (!response.ok) {
+    if (response.status === 401 && path !== '/auth/pair' && typeof window !== 'undefined') window.dispatchEvent(new Event('pocketagent:reauth'));
+    throw new Error(typeof data.message === 'string' ? data.message : typeof data.error === 'string' ? data.error : `連線失敗（${response.status}）`);
+  }
   return data as T;
 }
 const body = (value: unknown): string => JSON.stringify(value);
@@ -55,6 +58,7 @@ const errorMessages: Record<string, string> = {
   PAIRING_CODE_INVALID_OR_EXPIRED: '配對碼無效或已過期。請在電腦執行 npm run pair 取得新碼。',
   PAIRING_CODE_FORMAT_INVALID: '配對碼必須是 8 位數字，請確認後再試一次。',
   DEVICE_NAME_INVALID: '請輸入有效的裝置名稱，不能只包含空白。',
+  AUTHENTICATION_REQUIRED: '這個裝置需要配對，請輸入配對碼以接續工作。',
   HOST_NOT_ALLOWED: '這個服務位址未獲允許。請使用已設定的區網或 Tailscale IP 開啟網頁。',
   ORIGIN_REQUIRED: '請直接使用 PocketAgent 的服務位址開啟網頁，再重新操作。',
   ORIGIN_NOT_ALLOWED: '這個網頁來源未獲允許。請直接使用 PocketAgent 的服務位址。',
@@ -207,7 +211,7 @@ function PendingCard({ request, onRespond }: { request: PendingRequest; onRespon
 
 export const normalizePairingCode = (value: string) => value.normalize('NFKC').replace(/\D/g, '').slice(0, 8);
 
-export function Pairing({ onPaired }: { onPaired: () => void }) {
+export function Pairing({ onPaired }: { onPaired: () => void | Promise<void> }) {
   const [code, setCode] = useState('');
   const [deviceName, setDeviceName] = useState('我的裝置');
   const [busy, setBusy] = useState(false);
@@ -218,9 +222,24 @@ export function Pairing({ onPaired }: { onPaired: () => void }) {
     if (!/^[0-9]{8}$/.test(code)) { setError(errorText(new Error('PAIRING_CODE_FORMAT_INVALID'))); return; }
     if (!deviceName.trim()) { setError(errorText(new Error('DEVICE_NAME_INVALID'))); return; }
     setBusy(true); setError('');
-    try { await api('/auth/pair', { method: 'POST', body: body({ code, deviceName: deviceName.trim() }) }); onPaired(); } catch (reason) { setError(errorText(reason)); } finally { setBusy(false); }
+    try { await api('/auth/pair', { method: 'POST', body: body({ code, deviceName: deviceName.trim() }) }); await onPaired(); } catch (reason) { setError(errorText(reason)); } finally { setBusy(false); }
   };
   return <div className="pairing-screen"><div className="pairing-decoration" /><header className="pairing-brand"><Mark /><strong>PocketAgent<span>你的工作，隨身接續。</span></strong></header><main className="pairing-card"><div className="eyebrow"><span className="status-dot online" /> PRIVATE WORKSPACE</div><h1>連上你的<br /><em>工作空間。</em></h1><p className="pairing-description">與這台電腦配對，從手機接續 Codex 的每一項工作。</p><form onSubmit={(event) => void submit(event)}><label htmlFor="pair-code">一次性配對碼</label><input id="pair-code" className="code-input" autoComplete="one-time-code" inputMode="numeric" placeholder="輸入配對碼" value={code} onChange={(event) => setCode(normalizePairingCode(event.target.value))} onPaste={(event) => { event.preventDefault(); setCode(normalizePairingCode(event.clipboardData.getData('text'))); }} required autoFocus maxLength={8} minLength={8} pattern="[0-9]{8}" /><label htmlFor="device-name">裝置名稱</label><input id="device-name" value={deviceName} onChange={(event) => setDeviceName(event.target.value)} maxLength={64} required />{error ? <p className="inline-error" role="alert">{error}</p> : null}<button className="button accent pair-button" disabled={busy || !/^[0-9]{8}$/.test(code) || !deviceName.trim()}>{busy ? '正在配對…' : '配對這個裝置'}<Icon name="arrow" size={18} /></button></form><div className="pair-help"><Icon name="terminal" size={16} /><p>在電腦的 PocketAgent 目錄執行 <code>npm run pair</code> 取得配對碼。</p></div><footer><Icon name="shield" size={14} />配對碼 10 分鐘內有效 · 裝置驗證保留 30 天</footer></main><div className="pairing-bottom">LOCAL COMPUTE. ANYWHERE YOU ARE.</div></div>;
+}
+
+export function AccessFooter({ required, paired, connection, busy, onPairingChange, onLogout }: {
+  required: boolean; paired: boolean; connection: 'connecting' | 'connected' | 'disconnected'; busy: boolean;
+  onPairingChange: (required: boolean) => void; onLogout: () => void;
+}) {
+  const mode = required ? paired ? '裝置已配對' : '等待裝置配對' : '免配對';
+  return <footer className="sidebar-footer">
+    <div className="private-connection"><span className="connection-glyph"><Icon name="shield" size={17} /></span><div><strong>私人工作空間</strong><span>{mode} · {connection === 'connected' ? '私人連線' : '恢復連線中'}</span></div><span className={`status-dot ${connection === 'connected' ? 'online' : ''}`} /></div>
+    <div className="pairing-setting">
+      <label className="pairing-setting-control"><span>要求裝置配對</span><span className="pairing-setting-value">{busy ? '儲存中…' : required ? '開啟' : '關閉'}</span><input className="visually-hidden" type="checkbox" role="switch" aria-label="要求裝置配對" checked={required} disabled={busy} onChange={event => onPairingChange(event.target.checked)} /><span className={`pairing-switch ${required ? 'enabled' : ''}`} aria-hidden="true"><span /></span></label>
+      <p>關閉時，能連到服務的裝置可直接使用。</p>
+    </div>
+    {paired ? <button className="logout-button" onClick={onLogout}><Icon name="logout" size={15} />移除此裝置配對</button> : null}
+  </footer>;
 }
 
 function FileBrowser({ project, onClose }: { project: Project; onClose: () => void }) {
@@ -246,6 +265,9 @@ function FileBrowser({ project, onClose }: { project: Project; onClose: () => vo
 
 export function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [pairingRequired, setPairingRequired] = useState(true);
+  const [paired, setPaired] = useState(false);
+  const [pairingBusy, setPairingBusy] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
@@ -281,6 +303,10 @@ export function App() {
   const submissionRef = useRef<{ fingerprint: string; requestId: string } | null>(null);
   const viewEpochRef = useRef(0);
   const projectsRequestRef = useRef(0);
+  const projectViewRef = useRef<string | null>(null);
+  const accessRequestRef = useRef(0);
+  const accessMutationRef = useRef(false);
+  const accessStateRef = useRef<AuthState>({ authenticated: false, pairingRequired: true, paired: false });
   const project = projects.find((entry) => entry.id === projectId);
   const selectedThread = threads.find((entry) => entry.id === threadId);
   const isWorking = turns.some((turn) => ['inProgress', 'running', 'active'].includes(turn.status)) || selectedThread?.status?.type === 'active';
@@ -293,6 +319,20 @@ export function App() {
   useEffect(() => { projectRef.current = projectId; }, [projectId]);
   useEffect(() => { if (followRef.current) endRef.current?.scrollIntoView({ behavior: sending ? 'smooth' : 'instant', block: 'end' }); }, [turns, requests, sending]);
   useEffect(() => { const element = composerRef.current; if (element) { element.style.height = 'auto'; element.style.height = `${Math.min(element.scrollHeight, 180)}px`; } }, [text]);
+
+  const applyAccess = useCallback((access: AuthState) => {
+    accessStateRef.current = access;
+    setPairingRequired(access.pairingRequired);
+    setPaired(access.paired);
+    setAuthenticated(access.authenticated);
+  }, []);
+  const refreshAccess = useCallback(async () => {
+    if (accessMutationRef.current) return accessStateRef.current;
+    const request = ++accessRequestRef.current;
+    const access = await api<AuthState>('/auth');
+    if (request === accessRequestRef.current) applyAccess(access);
+    return access;
+  }, [applyAccess]);
 
   const refreshRequests = useCallback(async () => { try { setRequests((await api<{ requests: PendingRequest[] }>('/requests')).requests); } catch { /* Reconnection performs the next refresh. */ } }, []);
   const refreshProjects = useCallback(async () => {
@@ -323,9 +363,25 @@ export function App() {
 
   useEffect(() => {
     let live = true;
-    void api<{ authenticated: boolean }>('/auth').then((data) => { if (live) setAuthenticated(data.authenticated); }).catch((reason) => { if (live) { setAuthenticated(false); setError(errorText(reason)); } });
+    void refreshAccess().catch((reason) => { if (live) { setAuthenticated(false); setError(errorText(reason)); } });
     return () => { live = false; };
-  }, []);
+  }, [refreshAccess]);
+
+  useEffect(() => {
+    let live = true;
+    let inFlight = false;
+    const recheck = () => {
+      if (inFlight || document.visibilityState === 'hidden') return;
+      inFlight = true;
+      void refreshAccess().catch(() => { /* Preserve the current view through transient network failures. */ }).finally(() => { if (live) inFlight = false; });
+    };
+    const onVisibility = () => { if (document.visibilityState === 'visible') recheck(); };
+    window.addEventListener('focus', recheck);
+    window.addEventListener('pocketagent:reauth', recheck);
+    document.addEventListener('visibilitychange', onVisibility);
+    const timer = setInterval(recheck, 30_000);
+    return () => { live = false; clearInterval(timer); window.removeEventListener('focus', recheck); window.removeEventListener('pocketagent:reauth', recheck); document.removeEventListener('visibilitychange', onVisibility); };
+  }, [refreshAccess]);
 
   useEffect(() => {
     if (!authenticated) return;
@@ -341,8 +397,12 @@ export function App() {
 
   useEffect(() => {
     if (!authenticated) return;
-    viewEpochRef.current += 1;
-    setLoading(true); setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false);
+    if (projectViewRef.current !== projectId) {
+      projectViewRef.current = projectId;
+      viewEpochRef.current += 1;
+      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false);
+    }
+    setLoading(true);
     if (!projectId) { setLoading(false); return; }
     let live = true;
     void loadThreads(projectId).catch((reason) => { if (live) setError(errorText(reason)); }).finally(() => { if (live) setLoading(false); });
@@ -362,12 +422,15 @@ export function App() {
     if (!authenticated) return;
     let closed = false; let socket: WebSocket | undefined; let timer: ReturnType<typeof setTimeout>; let attempts = 0;
     const resync = () => {
-      void refreshProjects().catch(reason => { if (!closed) setError(errorText(reason)); });
-      void refreshRequests();
-      const id = threadRef.current; const pid = projectRef.current;
-      if (id && pid) void refreshHistory(id, pid).catch(() => undefined);
-      if (pid) void loadThreads(pid).catch(() => undefined);
-      void api<ServiceStatus>('/status').then(setStatus).catch(() => undefined);
+      void refreshAccess().then(access => {
+        if (closed || !access.authenticated) return;
+        void refreshProjects().catch(reason => { if (!closed) setError(errorText(reason)); });
+        void refreshRequests();
+        const id = threadRef.current; const pid = projectRef.current;
+        if (id && pid) void refreshHistory(id, pid).catch(() => undefined);
+        if (pid) void loadThreads(pid).catch(() => undefined);
+        void api<ServiceStatus>('/status').then(setStatus).catch(() => undefined);
+      }).catch(() => { /* The next reconnect retries access without clearing the current work. */ });
     };
     const connect = () => {
       setConnection('connecting');
@@ -400,12 +463,17 @@ export function App() {
         setTurns((previous) => applyThreadEvent(previous, event));
         if (event.method === 'turn/completed') { const pid = projectRef.current; if (pid) void loadThreads(pid).catch(() => undefined); }
       };
-      socket.onclose = () => { if (closed) return; setConnection('disconnected'); timer = setTimeout(connect, Math.min(1000 * 2 ** attempts++, 15000)); };
+      socket.onclose = () => {
+        if (closed) return;
+        setConnection('disconnected');
+        const retry = () => { if (!closed) timer = setTimeout(connect, Math.min(1000 * 2 ** attempts++, 15000)); };
+        void refreshAccess().then(access => { if (access.authenticated) retry(); }).catch(retry);
+      };
       socket.onerror = () => socket?.close();
     };
     connect();
     return () => { closed = true; clearTimeout(timer); socket?.close(); };
-  }, [authenticated, loadThreads, refreshHistory, refreshRequests, refreshProjects]);
+  }, [authenticated, loadThreads, refreshHistory, refreshRequests, refreshProjects, refreshAccess]);
 
   useEffect(() => {
     if (!authenticated || status.codex !== 'ready') return;
@@ -417,6 +485,8 @@ export function App() {
       const previousProject = projectRef.current;
       const previousThread = threadRef.current;
       try {
+        const access = await refreshAccess();
+        if (!live || !access.authenticated) return;
         await refreshProjects();
         if (!live) return;
         const pid = projectRef.current;
@@ -436,7 +506,7 @@ export function App() {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [authenticated, status.codex, refreshProjects, loadThreads, refreshHistory]);
+  }, [authenticated, status.codex, refreshProjects, loadThreads, refreshHistory, refreshAccess]);
 
   const chooseThread = async (entry: Thread) => {
     const epoch = ++viewEpochRef.current;
@@ -510,10 +580,26 @@ export function App() {
       setHistoryCursor(data.nextCursor || null);
     } catch (reason) { if (isCurrentView()) setError(errorText(reason)); }
   };
-  const logout = async () => { try { await api('/auth/logout', { method: 'POST' }); setAuthenticated(false); sequenceRef.current = 0; setThreads([]); setTurns([]); setText(''); setAttachments([]); } catch (reason) { setError(errorText(reason)); } };
+  const changePairing = async (required: boolean) => {
+    if (pairingBusy) return;
+    setPairingBusy(true);
+    accessMutationRef.current = true;
+    accessRequestRef.current += 1;
+    try {
+      const access = await api<AuthState>('/settings/pairing', { method: 'POST', body: body({ required }) });
+      accessRequestRef.current += 1;
+      applyAccess(access);
+    } catch (reason) { setError(errorText(reason)); }
+    finally {
+      accessMutationRef.current = false;
+      setPairingBusy(false);
+      void refreshAccess().catch(() => { /* Recheck on the next focus or reconnect if the network failed. */ });
+    }
+  };
+  const logout = async () => { try { await api('/auth/logout', { method: 'POST' }); await refreshAccess(); } catch (reason) { setError(errorText(reason)); } };
 
   if (authenticated === null) return <div className="boot-screen"><Mark /><span>正在連接工作空間<span className="loading-dots">…</span></span></div>;
-  if (!authenticated) return <Pairing onPaired={() => { setError(''); setAuthenticated(true); }} />;
+  if (!authenticated) return <Pairing onPaired={async () => { await refreshAccess(); setError(''); }} />;
   return <div className="app-shell">
     {sidebarOpen ? <button className="sidebar-backdrop" aria-label="收起選單" onClick={() => setSidebarOpen(false)} /> : null}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}><header className="brand"><Mark /><div><strong>PocketAgent</strong><span>你的工作，隨身接續。</span></div><button className="icon-button sidebar-close" aria-label="關閉選單" onClick={() => setSidebarOpen(false)}><Icon name="close" /></button></header>
@@ -521,7 +607,7 @@ export function App() {
       <button className="new-thread-button" onClick={newThread} disabled={!projectId}><Icon name="plus" size={18} />新增對話<span>＋</span></button>
       <div className="session-label">最近的對話<button className="icon-button" aria-label="重新整理對話" onClick={() => void loadThreads(projectId).catch((reason) => setError(errorText(reason)))} disabled={!projectId}><Icon name="refresh" size={14} /></button></div>
       <nav className="session-list" aria-label="對話紀錄">{threads.map((entry) => <button className={`session-row ${entry.id === threadId ? 'active' : ''}`} key={entry.id} onClick={() => void chooseThread(entry)}><Icon name="chat" size={16} /><span><strong>{entry.name || entry.preview || '新的對話'}</strong><small>{entry.status?.type === 'active' ? <><span className="status-dot online" />執行中</> : entry.id === threadId ? '目前的對話' : '點選以接續工作'}</small></span><time>{dateLabel(entry.updatedAt)}</time>{requests.some((request) => request.params.threadId === entry.id) ? <span className="request-dot" title="等待回覆" /> : null}</button>)}{!threads.length ? <div className="no-sessions"><Icon name="chat" size={25} /><p>{waitingForProjects ? catalogLoadingText : loading ? '正在讀取對話…' : '從一個新對話開始。'}<br /><span>{loading || waitingForProjects ? '稍候就能接續工作' : '這個 Codex 專案的對話會出現在這裡。'}</span></p></div> : null}{threadCursor ? <button className="load-more" onClick={() => void loadThreads(projectId, threadCursor).catch((reason) => setError(errorText(reason)))}>載入更早的對話</button> : null}</nav>
-      <footer className="sidebar-footer"><div className="private-connection"><span className="connection-glyph"><Icon name="shield" size={17} /></span><div><strong>私人工作空間</strong><span>{connection === 'connected' ? '裝置已配對 · 私人連線' : '正在恢復連線…'}</span></div><span className={`status-dot ${connection === 'connected' ? 'online' : ''}`} /></div><button className="logout-button" onClick={() => void logout()}><Icon name="logout" size={15} />取消此裝置的登入</button></footer>
+      <AccessFooter required={pairingRequired} paired={paired} connection={connection} busy={pairingBusy} onPairingChange={required => void changePairing(required)} onLogout={() => void logout()} />
     </aside>
     <main className="workspace"><header className="workspace-header"><div className="workspace-breadcrumb"><button className="icon-button mobile-menu" aria-label="開啟專案與對話" onClick={() => setSidebarOpen(true)}><Icon name="menu" size={20} /></button><span className="breadcrumb-project">{project?.name || 'Codex 專案'}</span><span className="breadcrumb-divider">/</span><span className="breadcrumb-thread">{selectedThread?.name || selectedThread?.preview || '新的對話'}</span></div><div className="workspace-actions"><span className={`service-pill ${status.codex === 'ready' ? 'ready' : ''}`}><span className={`status-dot ${status.codex === 'ready' ? 'online' : ''}`} /><span>{status.codex === 'ready' ? 'Codex 已就緒' : status.codex === 'starting' ? 'Codex 啟動中' : 'Codex 未連線'}</span></span>{threadId ? <button className="icon-button rename-button" aria-label="重新命名對話" title="重新命名對話" onClick={() => { setRenameValue(selectedThread?.name || ''); setRenaming(true); }}><Icon name="edit" size={17} /></button> : null}<button className={`icon-button file-toggle ${filesOpen ? 'selected' : ''}`} aria-label="瀏覽專案檔案" title="瀏覽專案檔案" disabled={!project} onClick={() => setFilesOpen(!filesOpen)}><Icon name="folder" size={19} /></button></div></header>
       {connection === 'disconnected' ? <div className="connection-banner"><Icon name="refresh" size={14} />連線暫時中斷，電腦上的工作仍會繼續。正在重新連線…</div> : null}

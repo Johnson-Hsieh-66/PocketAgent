@@ -9,7 +9,7 @@ import type { AppEvent, PendingRequest, ServiceStatus } from '../shared/types.js
 import type { AppConfig } from './config.js';
 import { Store } from './store.js';
 import { Files, HttpError } from './files.js';
-import { authenticate, checkBoundary, COOKIE_NAME, COOKIE_OPTIONS, validateRequestResult } from './auth.js';
+import { accessState, authenticate, checkBoundary, COOKIE_NAME, COOKIE_OPTIONS, tokenAuthorized, validateRequestResult } from './auth.js';
 
 export interface HttpBridge {
   status: ServiceStatus;
@@ -51,7 +51,7 @@ export async function buildApp({ config, store, bridge, files }: AppOptions): Pr
     const pathname = request.url.split('?')[0];
     if (pathname.startsWith('/api/')) {
       reply.header('Cache-Control', 'no-store');
-      if (!['/api/auth', '/api/auth/pair'].includes(pathname) && !authenticate(request, store)) throw new HttpError(401, 'AUTHENTICATION_REQUIRED');
+      if (!['/api/auth', '/api/auth/pair'].includes(pathname) && !accessState(request, store).authenticated) throw new HttpError(401, 'AUTHENTICATION_REQUIRED');
     }
   });
   app.setErrorHandler((error, _request, reply) => {
@@ -62,7 +62,13 @@ export async function buildApp({ config, store, bridge, files }: AppOptions): Pr
     reply.code(statusCode).send({ error: safeCode });
   });
 
-  app.get('/api/auth', async request => ({ authenticated: !!authenticate(request, store) }));
+  app.get('/api/auth', async request => accessState(request, store));
+  app.post('/api/settings/pairing', async request => {
+    const body = object(request.body);
+    if (Object.keys(body).length !== 1 || typeof body.required !== 'boolean') throw new HttpError(400, 'INVALID_PAIRING_SETTING');
+    store.setPairingRequired(body.required);
+    return accessState(request, store);
+  });
   app.post('/api/auth/pair', async (request, reply) => {
     const body = object(request.body);
     if (typeof body.code !== 'string' || body.code.length > 128) throw new HttpError(400, 'PAIRING_CODE_FORMAT_INVALID');
@@ -193,7 +199,7 @@ export async function buildApp({ config, store, bridge, files }: AppOptions): Pr
   app.get('/api/events', { websocket: true }, (socket, request) => {
     const token = request.cookies[COOKIE_NAME];
     const send = (event: AppEvent): void => {
-      if (!store.authenticate(token)) { socket.close(4401, 'Authentication required'); return; }
+      if (!tokenAuthorized(token, store)) { socket.close(4401, 'Authentication required'); return; }
       if (socket.readyState !== 1) return;
       if (socket.bufferedAmount > 1024 * 1024) { socket.close(1013, 'Reconnect to refresh'); return; }
       socket.send(JSON.stringify(event));
@@ -207,9 +213,12 @@ export async function buildApp({ config, store, bridge, files }: AppOptions): Pr
     send({ seq: 0, method: 'pocketagent/status', params: { status: bridge.status } });
     send({ seq: 0, method: 'pocketagent/requests', params: { requests: bridge.pendingRequests } });
     bridge.on('event', send);
-    const authTimer = setInterval(() => { if (!store.authenticate(token)) socket.close(4401, 'Authentication required'); }, 5000);
+    const authTimer = setInterval(() => { if (!tokenAuthorized(token, store)) socket.close(4401, 'Authentication required'); }, 5000);
     authTimer.unref();
-    socket.on('message', () => socket.close(4400, 'Read-only event stream'));
+    socket.on('message', () => {
+      if (!tokenAuthorized(token, store)) socket.close(4401, 'Authentication required');
+      else socket.close(4400, 'Read-only event stream');
+    });
     socket.on('error', () => { /* No raw messages or errors are logged. */ });
     socket.on('close', () => { clearInterval(authTimer); bridge.off('event', send); });
   });

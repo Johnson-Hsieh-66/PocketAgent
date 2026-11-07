@@ -20,11 +20,11 @@ npm run pair
 npm start
 ```
 
-`pair` 只在本機終端機顯示一次性配對碼，10 分鐘有效。手機在家開啟 `http://<LAN-IP>:47831`，外出則開啟 `http://<Tailscale-IP>:47831`，輸入配對碼即可使用。服務會記住裝置 30 天。
+新安裝預設開啟「要求裝置配對」。`pair` 只在本機終端機顯示一次性配對碼，10 分鐘有效。手機在家開啟 `http://<LAN-IP>:47831`，外出則開啟 `http://<Tailscale-IP>:47831`，輸入配對碼即可使用。服務會記住裝置 30 天。
 
 預設 `private` 模式會在個別的本機 loopback、實體網路介面的私人 LAN IPv4，以及 Tailscale IPv4 上提供服務，並每 5 秒更新可用介面。Tailscale 尚未連線時，本機與 LAN 仍可使用；DHCP 位址變更或 Tailscale 上線後，監聽位址會自動更新。
 
-各位址共用同一份專案、session 與 Codex 工作，但瀏覽器的裝置 cookie 依 IP 分開。第一次切換 LAN／Tailscale 位址，或 LAN IP 改變時，需要在電腦執行 `npm run pair` 產生新碼，再為該位址配對。建議出門前先完成 LAN 與 Tailscale 兩個位址的配對。
+各位址共用同一份專案、session 與 Codex 工作，但瀏覽器的裝置 cookie 依 IP 分開。啟用配對時，第一次切換 LAN／Tailscale 位址，或 LAN IP 改變時，需要在電腦執行 `npm run pair` 產生新碼，再為該位址配對。建議出門前先完成 LAN 與 Tailscale 兩個位址的配對。
 
 若你的 Tailscale 網路已有家中 LAN 的子網路由，且手機接受該路由、ACL 也允許存取，可在外面繼續使用同一個 LAN 網址。這取決於現有 Tailscale 設定，PocketAgent 不會自動新增或開放子網路由。
 
@@ -77,7 +77,21 @@ npm run revoke -- <device-id>
 npm run revoke -- all
 ```
 
-撤銷後，該裝置需重新配對。配對碼、裝置憑證與瀏覽器 cookie 都不可分享或提交至 Git。
+啟用配對時，撤銷後的裝置需重新配對。配對碼、裝置憑證與瀏覽器 cookie 都不可分享或提交至 Git。
+
+### 是否要求裝置配對
+
+可使用網頁的「要求裝置配對」開關，或在電腦執行：
+
+```powershell
+npm run pairing -- status
+npm run pairing -- off
+npm run pairing -- on
+```
+
+公開原始碼的新安裝預設為 `on`。關閉後，能連線到此私人網頁服務的客戶端即可操作 Codex，無須輸入配對碼。此開關只控制裝置配對，私人位址監聽、Host／Origin 檢查與 Codex 工作區權限仍持續適用。
+
+設定存於 repo 外的本機資料庫，立即生效，不需要重新啟動服務。切換開關會保留既有裝置紀錄；重新開啟後，有效配對繼續有效，未配對或憑證過期的裝置需完成配對。
 
 ## 使用方式
 

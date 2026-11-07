@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { api, applyThreadEvent, errorText, mergeHistory, mergeTurn, ModelOptions, normalizePairingCode, Pairing } from '../src/client/App';
+import { AccessFooter, api, applyThreadEvent, errorText, mergeHistory, mergeTurn, ModelOptions, normalizePairingCode, Pairing } from '../src/client/App';
 import type { AppEvent, Turn } from '../src/shared/types';
 
 const event = (method: string, params: Record<string, unknown>): AppEvent => ({ seq: 1, method, params: { threadId: 'fixture-thread', turnId: 'fixture-turn', ...params } });
@@ -48,6 +48,43 @@ describe('pairing input regression', () => {
     expect(normalizePairingCode('０１２３ ４５６７９')).toBe('01234567');
     expect(normalizePairingCode('ab０１２３-cd４５６７')).toBe('01234567');
     expect(normalizePairingCode('0123456')).toHaveLength(7);
+  });
+});
+
+describe('optional device pairing', () => {
+  const renderAccess = (required: boolean, paired: boolean, busy = false) => renderToStaticMarkup(createElement(AccessFooter, { required, paired, busy, connection: 'connected', onPairingChange: vi.fn(), onLogout: vi.fn() }));
+
+  it('renders anonymous private-network access with pairing off and no misleading logout', () => {
+    const markup = renderAccess(false, false);
+    const control = markup.match(/<input\b[^>]*\brole="switch"[^>]*>/)?.[0] || '';
+    expect(markup).toContain('免配對');
+    expect(markup).toContain('私人連線');
+    expect(markup).toContain('要求裝置配對');
+    expect(markup).toContain('關閉時，能連到服務的裝置可直接使用。');
+    expect(control).not.toMatch(/\bchecked(?:="")?/);
+    expect(markup).not.toContain('移除此裝置配對');
+  });
+
+  it('shows the real paired state and disables duplicate mode changes while saving', () => {
+    const markup = renderAccess(true, true, true);
+    const control = markup.match(/<input\b[^>]*\brole="switch"[^>]*>/)?.[0] || '';
+    expect(control).toMatch(/\bchecked(?:="")?/);
+    expect(control).toMatch(/\bdisabled(?:="")?/);
+    expect(markup).toContain('裝置已配對');
+    expect(markup).toContain('移除此裝置配對');
+    expect(markup).toContain('儲存中');
+  });
+
+  it('rechecks access on protected API rejection without treating a bad pairing code as a session logout', async () => {
+    const browser = new EventTarget();
+    const recheck = vi.fn();
+    browser.addEventListener('pocketagent:reauth', recheck);
+    vi.stubGlobal('window', browser);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(JSON.stringify({ error: 'AUTHENTICATION_REQUIRED' }), { status: 401 })));
+    await expect(api('/projects')).rejects.toThrow('AUTHENTICATION_REQUIRED');
+    expect(recheck).toHaveBeenCalledTimes(1);
+    await expect(api('/auth/pair', { method: 'POST', body: '{}' })).rejects.toThrow();
+    expect(recheck).toHaveBeenCalledTimes(1);
   });
 });
 

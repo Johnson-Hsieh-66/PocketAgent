@@ -8,6 +8,7 @@ PocketAgent is a private, self-hosted mobile web interface to the local Codex CL
 - Browser disconnection must not stop a turn. Never automatically replay a prompt after a crash. Only one active turn per thread.
 - Default to workspace-write and interactive approvals. Never silently weaken account or workspace policies.
 - Private network mode binds separate loopback, physical RFC1918 LAN and Tailscale listeners sharing one Codex bridge and store. Keep Host/Origin validation specific to each listener; never broaden this into wildcard or public-address binding.
+- Device pairing defaults ON for new installations. An explicit user choice may turn pairing OFF; persist that choice only in external runtime state, retain device records, and keep private binding and Host/Origin checks enforced in both modes.
 
 ## Privacy boundary
 - All runtime state belongs outside the checkout under the user's LOCALAPPDATA/PocketAgent directory (or an explicitly configured external data directory).
@@ -21,6 +22,6 @@ PocketAgent is a private, self-hosted mobile web interface to the local Codex CL
 ## Development
 - Run npm ci, npm run protocol:generate, npm run typecheck, npm test and npm run build as appropriate.
 - Keep Windows child launches hidden, avoid shell-interpolated arguments, and clean up only the process tree owned by this service.
-- Validate authenticated HTTP and WebSocket requests, Host/Origin, project roots and attachment ownership on the backend.
+- Enforce device authentication for HTTP and WebSocket requests when pairing is ON; always validate Host/Origin, project roots and attachment ownership on the backend.
 - Escape/sanitize rendered content. Never render model-provided raw HTML.
 - Keep tracked examples generic; local configuration is generated into the external runtime directory.

@@ -18,9 +18,18 @@ export class Store {
       CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS pairing (singleton INTEGER PRIMARY KEY CHECK(singleton=1), code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, path TEXT NOT NULL, created_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS submissions (request_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS submissions (request_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
   }
   close(): void { this.db.close(); }
+  pairingRequired(): boolean {
+    const setting = this.db.prepare("SELECT value FROM settings WHERE key='pairing_required'").get() as { value: string } | undefined;
+    return setting?.value !== '0';
+  }
+  setPairingRequired(required: boolean): void {
+    if (typeof required !== 'boolean') throw new Error('INVALID_PAIRING_SETTING');
+    this.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('pairing_required',?)").run(required ? '1' : '0');
+  }
   issuePairCode(): { code: string; expiresAt: number } {
     const code = randomInt(0, 100_000_000).toString().padStart(8, '0');
     const expiresAt = Date.now() + 10 * 60 * 1000;

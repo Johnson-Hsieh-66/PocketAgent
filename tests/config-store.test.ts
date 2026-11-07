@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { isAllowedHost, isLanAddress, isTailscaleAddress, isLoopbackAddress, loadConfig } from '../src/server/config.js';
 import { Store } from '../src/server/store.js';
 
@@ -82,6 +83,28 @@ describe('external runtime configuration and pairing limits', () => {
       store.close();
       store = new Store(temp);
       expect(store.readSubmission('synthetic-request-id')).toBeNull();
+    } finally { store.close(); }
+  });
+  it('requires pairing by default and shares persistent mode changes across store connections and restarts', () => {
+    let store = new Store(temp);
+    try {
+      expect(store.pairingRequired()).toBe(true);
+      store.setPairingRequired(false);
+      store.close();
+      store = new Store(temp);
+      expect(store.pairingRequired()).toBe(false);
+      const anotherConnection = new Store(temp);
+      try {
+        anotherConnection.setPairingRequired(true);
+        expect(store.pairingRequired()).toBe(true);
+      } finally { anotherConnection.close(); }
+      store.close();
+      store = new Store(temp);
+      expect(store.pairingRequired()).toBe(true);
+      const external = new DatabaseSync(path.join(temp, 'state.sqlite'));
+      try { external.prepare("UPDATE settings SET value='unrecognized' WHERE key='pairing_required'").run(); }
+      finally { external.close(); }
+      expect(store.pairingRequired()).toBe(true);
     } finally { store.close(); }
   });
 });

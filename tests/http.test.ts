@@ -86,7 +86,7 @@ describe('private HTTP boundary and project access', () => {
       for (const [index, listener] of listeners.entries()) {
         const own = { host: `${hosts[index]}:3000`, origin: `http://${hosts[index]}:3000` };
         const other = { host: `${hosts[1 - index]}:3000`, origin: `http://${hosts[1 - index]}:3000` };
-        expect((await listener.inject({ url: '/api/auth', headers: own })).json()).toEqual({ authenticated: false });
+        expect((await listener.inject({ url: '/api/auth', headers: own })).json()).toEqual({ authenticated: false, pairingRequired: true, paired: false });
         expect((await listener.inject({ url: '/api/projects', headers: own })).statusCode).toBe(401);
         const { code } = store.issuePairCode();
         const paired = await listener.inject({ method: 'POST', url: '/api/auth/pair', headers: own, payload: { code, deviceName: `Synthetic listener ${index}` } });
@@ -107,6 +107,15 @@ describe('private HTTP boundary and project access', () => {
       for (const [index, listener] of listeners.entries()) {
         expect((await listener.inject({ url: '/api/projects', headers: { host: `${hosts[index]}:3000`, cookie } })).statusCode).toBe(401);
       }
+      store.setPairingRequired(false);
+      for (const [index, listener] of listeners.entries()) {
+        const own = { host: `${hosts[index]}:3000`, origin: `http://${hosts[index]}:3000` };
+        expect((await listener.inject({ url: '/api/auth', headers: own })).json()).toEqual({ authenticated: true, pairingRequired: false, paired: false });
+        expect((await listener.inject({ url: '/api/projects', headers: own })).statusCode).toBe(200);
+      }
+      const reenabling = await listeners[0].inject({ method: 'POST', url: '/api/settings/pairing', headers: { host: `${hosts[0]}:3000`, origin: `http://${hosts[0]}:3000` }, payload: { required: true } });
+      expect(reenabling.statusCode).toBe(200);
+      expect((await listeners[1].inject({ url: '/api/projects', headers: { host: `${hosts[1]}:3000` } })).statusCode).toBe(401);
     } finally {
       for (const socket of sockets) socket.terminate();
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -124,6 +133,73 @@ describe('private HTTP boundary and project access', () => {
     const logout = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...headers, cookie } });
     expect(logout.statusCode).toBe(200);
     expect((await app.inject({ url: '/api/status', headers: { ...headers, cookie } })).statusCode).toBe(401);
+  });
+  it('switches pairing with strict validation while preserving boundaries, existing cookies and logout revocation', async () => {
+    expect((await app.inject({ url: '/api/auth', headers })).json()).toEqual({ authenticated: false, pairingRequired: true, paired: false });
+    expect((await app.inject({ method: 'POST', url: '/api/settings/pairing', headers, payload: { required: false } })).statusCode).toBe(401);
+    for (const payload of [{}, { required: 'false' }, { required: 0 }, { required: false, extra: true }]) {
+      expect((await app.inject({ method: 'POST', url: '/api/settings/pairing', headers: { ...headers, cookie }, payload })).statusCode).toBe(400);
+      expect(store.pairingRequired()).toBe(true);
+    }
+    const disabled = await app.inject({ method: 'POST', url: '/api/settings/pairing', headers: { ...headers, cookie }, payload: { required: false } });
+    expect(disabled.json()).toEqual({ authenticated: true, pairingRequired: false, paired: true });
+    expect((await app.inject({ url: '/api/auth', headers })).json()).toEqual({ authenticated: true, pairingRequired: false, paired: false });
+    expect((await app.inject({ url: '/api/projects', headers })).statusCode).toBe(200);
+    expect((await app.inject({ url: '/api/projects', headers: { ...headers, host: 'attacker.invalid:3000' } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/api/settings/pairing', headers: { host: headers.host }, payload: { required: true } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/api/settings/pairing', headers: { ...headers, origin: 'http://attacker.invalid' }, payload: { required: true } })).statusCode).toBe(403);
+    expect(store.pairingRequired()).toBe(false);
+    const enabled = await app.inject({ method: 'POST', url: '/api/settings/pairing', headers, payload: { required: true } });
+    expect(enabled.json()).toEqual({ authenticated: false, pairingRequired: true, paired: false });
+    expect((await app.inject({ url: '/api/projects', headers })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'POST', url: '/api/settings/pairing', headers, payload: { required: false } })).statusCode).toBe(401);
+    expect((await app.inject({ url: '/api/auth', headers: { ...headers, cookie } })).json()).toEqual({ authenticated: true, pairingRequired: true, paired: true });
+    expect((await app.inject({ url: '/api/projects', headers: { ...headers, cookie } })).statusCode).toBe(200);
+    store.setPairingRequired(false);
+    await expect(app.injectWS('/api/events', { headers: { host: headers.host } })).rejects.toThrow('403');
+    expect((await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...headers, cookie } })).statusCode).toBe(200);
+    expect((await app.inject({ url: '/api/auth', headers: { ...headers, cookie } })).json()).toEqual({ authenticated: true, pairingRequired: false, paired: false });
+    store.setPairingRequired(true);
+    expect((await app.inject({ url: '/api/projects', headers: { ...headers, cookie } })).statusCode).toBe(401);
+  });
+  it('authorizes unpaired websocket access only while pairing is off and rechecks before each event and on its timer', async () => {
+    store.setPairingRequired(false);
+    await expect(app.injectWS('/api/events', { headers: { ...headers, origin: 'http://attacker.invalid' } })).rejects.toThrow('403');
+    await expect(app.injectWS('/api/events', { headers: { ...headers, host: 'attacker.invalid:3000' } })).rejects.toThrow('403');
+    const sockets: Awaited<ReturnType<FastifyInstance['injectWS']>>[] = [];
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const socket = await app.injectWS('/api/events?after=0', { headers });
+      sockets.push(socket);
+      const received = once(socket, 'message');
+      bridge.emit('event', { seq: 1, method: 'synthetic/allowed-without-pairing', params: {} });
+      expect(JSON.parse((await received)[0].toString()).method).toBe('synthetic/allowed-without-pairing');
+      const onMessage = vi.fn();
+      socket.on('message', onMessage);
+      const closed = once(socket, 'close');
+      store.setPairingRequired(true);
+      bridge.emit('event', { seq: 2, method: 'synthetic/protected-after-enable', params: {} });
+      expect((await closed)[0]).toBe(4401);
+      expect(onMessage).not.toHaveBeenCalled();
+      await expect(app.injectWS('/api/events', { headers })).rejects.toThrow('401');
+      const pairedSocket = await app.injectWS('/api/events', { headers: { ...headers, cookie } });
+      sockets.push(pairedSocket);
+      const pairedReceived = once(pairedSocket, 'message');
+      bridge.emit('event', { seq: 3, method: 'synthetic/still-paired', params: {} });
+      expect(JSON.parse((await pairedReceived)[0].toString()).method).toBe('synthetic/still-paired');
+      store.setPairingRequired(false);
+      const timerSocket = await app.injectWS('/api/events', { headers });
+      sockets.push(timerSocket);
+      const timerClosed = once(timerSocket, 'close');
+      store.setPairingRequired(true);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect((await timerClosed)[0]).toBe(4401);
+      expect(bridge.interrupt).not.toHaveBeenCalled();
+    } finally {
+      for (const socket of sockets) socket.terminate();
+      vi.useRealTimers();
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
   });
   it('accepts copied separators and fullwidth pairing digits without changing code identity', async () => {
     const formats = [
