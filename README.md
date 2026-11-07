@@ -106,6 +106,8 @@ npm run pairing -- on
 
 同一 session 一次僅接受一個工作。請在 CLI 與網頁之間擇一操作同一 session，避免同時續聊。
 
+若續接時出現「其他 Codex 客戶端正在使用此對話」（`THREAD_WRITER_CONFLICT`），代表其他客戶端仍持有該 session 的寫入權。請先讓原客戶端釋放該對話，再於網頁重試；即使沒有正在生成，原客戶端仍可能持有寫入權，停止生成或最小化視窗也不保證釋放。PocketAgent 不會強制解鎖或關閉其他客戶端。
+
 從網頁新建或續接 session 時，會套用 PocketAgent 的 `workspace-write` 與 `on-request` 權限預設，覆寫該 session 原本的個別偏好；帳號與組織的強制政策仍然優先。
 
 ### 目前的互動限制
@@ -115,6 +117,8 @@ npm run pairing -- on
 ## 本機設定與資料
 
 所有執行資料存於 `%LOCALAPPDATA%\PocketAgent`，包含本機設定、配對與裝置索引、圖片及診斷日誌。Codex 原有認證與 session 由 CLI 管理，PocketAgent 不直接修改其儲存檔案。
+
+診斷會直接寫入執行資料目錄的 `logs/diagnostics.jsonl`，不依賴終端機輸出。每個檔案最多 1 MiB，連同兩個輪替備份共保留最多三個檔案。記錄僅包含時間、固定狀態／錯誤代碼、元件、固定 API 路由或 RPC 方法，以及必要的數值狀態與耗時；不記錄對話、實際請求網址、檔案路徑、識別碼、原始錯誤或憑證。磁碟寫入失敗不會中斷 Codex 工作。
 
 可在外部資料目錄的 `config.json` 設定：
 

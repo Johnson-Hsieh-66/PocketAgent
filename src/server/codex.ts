@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import type { AppEvent, PendingRequest, ServiceStatus } from '../shared/types.js';
 import type { ClientRequest } from '../../.generated/codex/ClientRequest.js';
 import type { InitializeParams } from '../../.generated/codex/InitializeParams.js';
+import { sanitizeDiagnostic, type DiagnosticInput, type DiagnosticSink } from './diagnostics.js';
 
 export interface CodexCommand { command: string; args: string[] }
 export interface SubmissionLedger {
@@ -12,7 +13,10 @@ export interface SubmissionLedger {
   recordSubmission(id: string, threadId: string, fingerprint: string): void;
   forgetSubmission(id: string): void;
 }
-type RpcPending = { method: string; resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
+export class CodexRpcError extends Error {
+  constructor(message: 'CODEX_RPC_ERROR' | 'THREAD_WRITER_CONFLICT', public readonly rpcCode?: number) { super(message); this.name = 'CodexRpcError'; }
+}
+type RpcPending = { method: string; startedAt: number; resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 export class CodexBridge extends EventEmitter {
   status: ServiceStatus = { codex: 'offline' };
   private child?: ChildProcessWithoutNullStreams;
@@ -25,7 +29,10 @@ export class CodexBridge extends EventEmitter {
   private sends = new Map<string, { threadId: string; fingerprint: string; result: Promise<any> }>();
   private stopping = false;
   get pendingRequests() { return [...this.requests.values()]; }
-  constructor(private executable: CodexCommand, private ledger?: SubmissionLedger) { super(); }
+  constructor(private executable: CodexCommand, private ledger?: SubmissionLedger, private diagnostic?: DiagnosticSink) { super(); }
+  private report(entry: Omit<DiagnosticInput, 'component'>) {
+    try { this.diagnostic?.(sanitizeDiagnostic({ component: 'codex', ...entry })); } catch { /* Diagnostics never affect agent work. */ }
+  }
   publish(method: string, params: Record<string, unknown> = {}) {
     const event: AppEvent = { seq: ++this.seq, method, params };
     this.journal.push(event);
@@ -36,7 +43,11 @@ export class CodexBridge extends EventEmitter {
   eventsSince(after: number) {
     return { events: this.journal.filter(e => e.seq > after), reset: after > this.seq || (after > 0 && after < (this.journal[0]?.seq ?? 1) - 1) };
   }
-  private setStatus(status: ServiceStatus) { this.status = status; this.publish('pocketagent/status', { status }); }
+  private setStatus(status: ServiceStatus) {
+    this.status = status;
+    this.report({ code: status.codex === 'starting' ? 'CODEX_STARTING' : status.codex === 'ready' ? 'CODEX_READY' : status.error || 'CODEX_OFFLINE' });
+    this.publish('pocketagent/status', { status });
+  }
   async start() {
     if (this.child) return;
     this.stopping = false;
@@ -47,7 +58,7 @@ export class CodexBridge extends EventEmitter {
     child.stderr.resume(); // Never forward possibly sensitive CLI diagnostics to logs.
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     lines.on('line', line => {
-      try { this.receive(JSON.parse(line)); } catch { this.publish('pocketagent/protocolError', { code: 'INVALID_RPC_MESSAGE' }); }
+      try { this.receive(JSON.parse(line)); } catch { this.report({ code: 'INVALID_RPC_MESSAGE' }); this.publish('pocketagent/protocolError', { code: 'INVALID_RPC_MESSAGE' }); }
     });
     child.on('error', () => { if (this.child === child) this.child = undefined; lines.close(); this.disconnected('CODEX_START_FAILED'); });
     child.on('exit', () => { lines.close(); this.child = undefined; this.disconnected(this.stopping ? 'STOPPED' : 'CODEX_EXITED'); });
@@ -79,11 +90,16 @@ export class CodexBridge extends EventEmitter {
   }
   request(method: ClientRequest['method'] | string, params: any = {}): Promise<any> {
     const id = this.nextId++;
+    const startedAt = performance.now();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.rpc.delete(id); reject(new Error('CODEX_REQUEST_TIMEOUT')); }, 45_000);
+      const timer = setTimeout(() => { this.rpc.delete(id); this.report({ code: 'CODEX_REQUEST_TIMEOUT', operation: method, durationMs: Math.round(performance.now() - startedAt) }); reject(new Error('CODEX_REQUEST_TIMEOUT')); }, 45_000);
       timer.unref();
-      this.rpc.set(id, { method, resolve, reject, timer });
-      try { this.write({ id, method, params }); } catch (error) { clearTimeout(timer); this.rpc.delete(id); reject(error); }
+      this.rpc.set(id, { method, startedAt, resolve, reject, timer });
+      try { this.write({ id, method, params }); } catch (error) {
+        clearTimeout(timer); this.rpc.delete(id);
+        this.report({ code: error instanceof Error && error.message === 'CODEX_OFFLINE' ? 'CODEX_OFFLINE' : 'CODEX_RPC_WRITE_FAILED', operation: method, durationMs: Math.round(performance.now() - startedAt) });
+        reject(error);
+      }
     });
   }
   private receive(message: any) {
@@ -91,7 +107,14 @@ export class CodexBridge extends EventEmitter {
       const pending = this.rpc.get(message.id);
       if (!pending) return;
       clearTimeout(pending.timer); this.rpc.delete(message.id);
-      if (message.error) { const err = new Error('CODEX_RPC_ERROR'); Object.assign(err, { rpcCode: message.error.code }); pending.reject(err); }
+      if (message.error) {
+        const rpcCode = Number.isInteger(message.error.code) ? message.error.code : undefined;
+        const conflict = rpcCode === -32600 && typeof message.error.message === 'string' && /^thread\s+\S+\s+already has an active writer\.?$/i.test(message.error.message.trim());
+        const code = conflict ? 'THREAD_WRITER_CONFLICT' : 'CODEX_RPC_ERROR';
+        const err = new CodexRpcError(code, rpcCode);
+        this.report({ code, operation: pending.method, rpcCode, durationMs: Math.round(performance.now() - pending.startedAt) });
+        pending.reject(err);
+      }
       else {
         if (['thread/read', 'thread/resume', 'thread/start'].includes(pending.method)) {
           const thread = message.result?.thread;
@@ -152,7 +175,7 @@ export class CodexBridge extends EventEmitter {
       return value;
     }).catch(error => {
       if (error?.message !== 'CODEX_REQUEST_TIMEOUT') this.active.delete(threadId);
-      if (error?.message === 'CODEX_RPC_ERROR') { this.ledger?.forgetSubmission(requestId); this.sends.delete(requestId); }
+      if (error instanceof CodexRpcError) { this.ledger?.forgetSubmission(requestId); this.sends.delete(requestId); }
       throw error;
     });
     this.sends.set(requestId, { threadId, fingerprint, result });

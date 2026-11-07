@@ -10,6 +10,7 @@ import type { AppConfig } from './config.js';
 import { Store } from './store.js';
 import { Files, HttpError } from './files.js';
 import { accessState, authenticate, checkBoundary, COOKIE_NAME, COOKIE_OPTIONS, tokenAuthorized, validateRequestResult } from './auth.js';
+import { safeDiagnosticCode, sanitizeDiagnostic, type DiagnosticSink } from './diagnostics.js';
 
 export interface HttpBridge {
   status: ServiceStatus;
@@ -22,7 +23,7 @@ export interface HttpBridge {
   startTurn(threadId: string, params: any, requestId: string): Promise<any>;
   interrupt(threadId: string): Promise<any>;
 }
-interface AppOptions { config: AppConfig; store: Store; bridge: HttpBridge; files: Files }
+interface AppOptions { config: AppConfig; store: Store; bridge: HttpBridge; files: Files; diagnostic?: DiagnosticSink }
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): ObjectValue => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, 'INVALID_INPUT');
@@ -35,14 +36,16 @@ const string = (value: unknown, max = 1000): string => {
 const query = (request: FastifyRequest): ObjectValue => (request.query || {}) as ObjectValue;
 const params = (request: FastifyRequest): ObjectValue => request.params as ObjectValue;
 
-export async function buildApp({ config, store, bridge, files }: AppOptions): Promise<FastifyInstance> {
+export async function buildApp({ config, store, bridge, files, diagnostic }: AppOptions): Promise<FastifyInstance> {
   if (config.host === 'tailscale' || config.host === 'private') throw new Error('LISTENER_HOST_NOT_RESOLVED');
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024, requestTimeout: 30_000, trustProxy: false });
   await app.register(cookie);
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 0, parts: 1 } });
   await app.register(websocket, { options: { maxPayload: 4096 } });
 
+  const started = new WeakMap<FastifyRequest, number>();
   app.addHook('onRequest', async (request, reply) => {
+    started.set(request, performance.now());
     checkBoundary(request, config);
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
@@ -54,11 +57,17 @@ export async function buildApp({ config, store, bridge, files }: AppOptions): Pr
       if (!['/api/auth', '/api/auth/pair'].includes(pathname) && !accessState(request, store).authenticated) throw new HttpError(401, 'AUTHENTICATION_REQUIRED');
     }
   });
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     const message = error instanceof Error ? error.message : '';
     const rawStatus = typeof error === 'object' && error !== null && 'statusCode' in error ? error.statusCode : undefined;
     const safeCode = error instanceof HttpError ? error.message : /^[A-Z][A-Z_]{2,79}$/.test(message) ? message : 'REQUEST_FAILED';
-    const statusCode = error instanceof HttpError ? error.statusCode : typeof rawStatus === 'number' && rawStatus >= 400 && rawStatus < 600 ? rawStatus : safeCode === 'THREAD_BUSY' ? 409 : safeCode === 'CODEX_OFFLINE' ? 503 : 500;
+    const statusCode = error instanceof HttpError ? error.statusCode : typeof rawStatus === 'number' && rawStatus >= 400 && rawStatus < 600 ? rawStatus : ['THREAD_BUSY', 'THREAD_WRITER_CONFLICT'].includes(safeCode) ? 409 : safeCode === 'CODEX_OFFLINE' ? 503 : 500;
+    try {
+      const rpcCode = typeof error === 'object' && error !== null && 'rpcCode' in error && typeof error.rpcCode === 'number' ? error.rpcCode : undefined;
+      diagnostic?.(sanitizeDiagnostic({ component: 'http', code: safeDiagnosticCode(safeCode), operation: request.routeOptions.url,
+        method: request.method, httpStatus: statusCode, rpcCode,
+        durationMs: Math.max(0, performance.now() - (started.get(request) ?? performance.now())) }));
+    } catch { /* Diagnostic consumers must not change the HTTP response. */ }
     reply.code(statusCode).send({ error: safeCode });
   });
 
@@ -219,7 +228,9 @@ export async function buildApp({ config, store, bridge, files }: AppOptions): Pr
       if (!tokenAuthorized(token, store)) socket.close(4401, 'Authentication required');
       else socket.close(4400, 'Read-only event stream');
     });
-    socket.on('error', () => { /* No raw messages or errors are logged. */ });
+    socket.on('error', () => {
+      try { diagnostic?.({ component: 'http', code: 'WEBSOCKET_ERROR', operation: '/api/events', method: 'GET' }); } catch { /* best effort */ }
+    });
     socket.on('close', () => { clearInterval(authTimer); bridge.off('event', send); });
   });
   if (config.staticDir && existsSync(config.staticDir)) {

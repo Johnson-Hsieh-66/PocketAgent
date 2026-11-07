@@ -54,6 +54,9 @@ const errorMessages: Record<string, string> = {
   REQUEST_ALREADY_SUBMITTED: '這則訊息可能已送出。請先查看對話紀錄，確認後再編輯或建立新訊息。',
   THREAD_BUSY: '這個對話仍有工作正在執行。請等待完成，或先停止目前的工作。',
   CODEX_OFFLINE: 'Codex 目前未連線。請在電腦上確認 CLI 狀態，再重新連線。',
+  THREAD_RESUME_FAILED: '已載入可讀取的對話紀錄，但目前無法接續。請重新選取這個對話再試一次。',
+  THREAD_WRITER_CONFLICT: '這個對話目前由其他 Codex 客戶端開啟，暫時只能檢視；原客戶端釋放後，再重新選取以接續。',
+  INVALID_ATTACHMENTS: '每則訊息最多附加 8 張圖片。',
   REQUEST_ID_CONFLICT: '這則訊息與先前送出的內容不一致。請確認內容並編輯後重新傳送。',
   PAIRING_CODE_INVALID_OR_EXPIRED: '配對碼無效或已過期。請在電腦執行 npm run pair 取得新碼。',
   PAIRING_CODE_FORMAT_INVALID: '配對碼必須是 8 位數字，請確認後再試一次。',
@@ -287,6 +290,7 @@ export function App() {
   const [uploading, setUploading] = useState(false);
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [continuationReady, setContinuationReady] = useState(true);
   const [error, setError] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
@@ -297,6 +301,7 @@ export function App() {
   const sequenceRef = useRef(0);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
+  const uploadInFlightRef = useRef(false);
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
@@ -400,7 +405,7 @@ export function App() {
     if (projectViewRef.current !== projectId) {
       projectViewRef.current = projectId;
       viewEpochRef.current += 1;
-      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false);
+      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false); setContinuationReady(true);
     }
     setLoading(true);
     if (!projectId) { setLoading(false); return; }
@@ -512,18 +517,26 @@ export function App() {
     const epoch = ++viewEpochRef.current;
     const selectedProject = projectId;
     const isCurrentView = () => epoch === viewEpochRef.current && threadRef.current === entry.id && projectRef.current === selectedProject;
-    setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); setLoading(true); setError(''); setAttachments([]); followRef.current = true;
-    try {
-      const resumed = await api<{ thread: Thread; model?: string }>(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId: selectedProject }) });
+    setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); setLoading(true); setContinuationReady(false); setModel(''); setError(''); setAttachments([]); followRef.current = true;
+    const history = refreshHistory(entry.id, selectedProject);
+    const resume = api<{ thread: Thread; model?: string }>(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId: selectedProject }) }).then(resumed => {
       if (!isCurrentView()) return;
       setModel(typeof resumed.model === 'string' ? resumed.model : '');
-      await refreshHistory(entry.id, selectedProject);
-      await refreshRequests();
-    } catch (reason) { if (isCurrentView()) setError(errorText(reason)); } finally { if (isCurrentView()) setLoading(false); }
+      setContinuationReady(true);
+    });
+    const [historyResult, resumeResult] = await Promise.allSettled([history, resume]);
+    if (!isCurrentView()) return;
+    if (resumeResult.status === 'rejected') {
+      const writerConflict = resumeResult.reason instanceof Error && resumeResult.reason.message === 'THREAD_WRITER_CONFLICT';
+      setError(writerConflict ? `${historyResult.status === 'fulfilled' ? '對話紀錄已載入。' : ''}${errorText(resumeResult.reason)}` : historyResult.status === 'fulfilled' ? errorText(new Error('THREAD_RESUME_FAILED')) : errorText(resumeResult.reason));
+    }
+    else if (historyResult.status === 'rejected') setError(errorText(historyResult.reason));
+    setLoading(false);
+    await refreshRequests();
   };
-  const newThread = () => { viewEpochRef.current += 1; setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
+  const newThread = () => { viewEpochRef.current += 1; setLoading(false); setContinuationReady(true); setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
   const send = async () => {
-    if ((!text.trim() && !attachments.length) || sending || loading || isWorking || !projectId || status.codex !== 'ready' || status.authenticated === false) return;
+    if ((!text.trim() && !attachments.length) || sending || loading || !continuationReady || isWorking || !projectId || status.codex !== 'ready' || status.authenticated === false) return;
     const epoch = viewEpochRef.current;
     const sendProject = projectId;
     const sentText = text;
@@ -551,12 +564,16 @@ export function App() {
   const interrupt = async () => { try { await api(`/threads/${encodeURIComponent(threadId)}/interrupt`, { method: 'POST', body: body({ projectId }) }); } catch (reason) { setError(errorText(reason)); } };
   const upload = async (files: FileList | File[]) => {
     if (!projectId) return;
+    if (uploadInFlightRef.current) { setError('圖片仍在上傳，請稍後再加入圖片。'); return; }
+    const batch = Array.from(files);
+    if (attachments.length + batch.length > 8) { setError(errorText(new Error('INVALID_ATTACHMENTS'))); return; }
     const uploadProject = projectId;
     const epoch = viewEpochRef.current;
     const isCurrentView = () => projectRef.current === uploadProject && viewEpochRef.current === epoch;
+    uploadInFlightRef.current = true;
     setUploading(true); setError('');
     try {
-      for (const file of Array.from(files)) {
+      for (const file of batch) {
         if (!isCurrentView()) break;
         if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) throw new Error('請選擇 JPEG、PNG 或 WebP 圖片。');
         if (file.size > 10 * 1024 * 1024) throw new Error('每張圖片最多 10 MiB。');
@@ -564,7 +581,7 @@ export function App() {
         const attachment = await api<Attachment>(`/uploads?projectId=${encodeURIComponent(uploadProject)}`, { method: 'POST', body: form });
         if (isCurrentView()) setAttachments((previous) => [...previous, attachment]);
       }
-    } catch (reason) { if (isCurrentView()) setError(errorText(reason)); } finally { setUploading(false); if (uploadRef.current) uploadRef.current.value = ''; }
+    } catch (reason) { if (isCurrentView()) setError(errorText(reason)); } finally { uploadInFlightRef.current = false; setUploading(false); if (uploadRef.current) uploadRef.current.value = ''; }
   };
   const respond = async (id: string | number, result: unknown) => { await api(`/requests/${encodeURIComponent(String(id))}`, { method: 'POST', body: body({ result }) }); await refreshRequests(); };
   const rename = async (event: FormEvent) => { event.preventDefault(); try { await api(`/threads/${encodeURIComponent(threadId)}`, { method: 'PATCH', body: body({ projectId, name: renameValue.trim() }) }); setThreads((previous) => previous.map((entry) => entry.id === threadId ? { ...entry, name: renameValue.trim() } : entry)); setRenaming(false); } catch (reason) { setError(errorText(reason)); } };
@@ -620,7 +637,7 @@ export function App() {
         <div className="composer-area">{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="關閉錯誤訊息" onClick={() => setError('')}><Icon name="close" size={15} /></button></div> : null}<form className={`composer ${sending ? 'busy' : ''}`} onSubmit={(event) => { event.preventDefault(); void send(); }}>
           {attachments.length ? <div className="attachment-list">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}><img src={`/api/uploads/${encodeURIComponent(attachment.id)}`} alt={attachment.name} /><span>{attachment.name}</span><button type="button" className="icon-button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((previous) => previous.filter((entry) => entry.id !== attachment.id))}><Icon name="close" size={13} /></button></div>)}</div> : null}
           <textarea ref={composerRef} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !window.matchMedia('(pointer: coarse)').matches) { event.preventDefault(); void send(); } }} onPaste={(event) => { const imageFiles = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/')); if (imageFiles.length) { event.preventDefault(); void upload(imageFiles); } }} placeholder={isWorking ? '工作進行中，完成後可傳送下一則訊息…' : '交代下一步，或附上一張圖片…'} aria-label="傳送給 Codex 的訊息" rows={2} disabled={!projectId} />
-          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => setModel(event.target.value)} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || loading || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />工作區寫入 · 需要時核准</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
+          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => setModel(event.target.value)} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || loading || !continuationReady || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />工作區寫入 · 需要時核准</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
       </div>{filesOpen && project ? <FileBrowser key={project.id} project={project} onClose={() => setFilesOpen(false)} /> : null}</div>
     </main>
     {renaming ? <div className="modal-backdrop" onClick={() => setRenaming(false)}><form className="rename-modal" onClick={(event) => event.stopPropagation()} onSubmit={(event) => void rename(event)}><h2>重新命名對話</h2><label htmlFor="thread-name">對話名稱</label><input id="thread-name" value={renameValue} onChange={(event) => setRenameValue(event.target.value)} maxLength={100} autoFocus required /><div><button type="button" className="button subtle" onClick={() => setRenaming(false)}>取消</button><button className="button accent" disabled={!renameValue.trim()}>儲存名稱</button></div></form></div> : null}

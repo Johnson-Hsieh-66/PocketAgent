@@ -292,6 +292,20 @@ describe('private HTTP boundary and project access', () => {
     expect(interruption.statusCode).toBe(403);
     expect(bridge.interrupt).not.toHaveBeenCalled();
   });
+  it('reports another client writer as a conflict while leaving existing history readable', async () => {
+    const originalRequest = bridge.request.getMockImplementation()!;
+    bridge.request.mockImplementation(async (method, rpcParams) => {
+      if (method === 'thread/resume') throw new Error('THREAD_WRITER_CONFLICT');
+      return originalRequest(method, rpcParams);
+    });
+    const resumed = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId } });
+    expect(resumed.statusCode).toBe(409);
+    expect(resumed.json()).toEqual({ error: 'THREAD_WRITER_CONFLICT' });
+    const history = await app.inject({ url: `/api/threads/synthetic-thread/turns?projectId=${projectId}`, headers: { ...headers, cookie } });
+    expect(history.statusCode).toBe(200);
+    expect(history.json().data).toHaveLength(1);
+    expect(bridge.startTurn).not.toHaveBeenCalled();
+  });
   it('reuses original desktop thread identities and merges only assigned legacy history on the first page', async () => {
     const native = { id: 'synthetic-native-thread', projectId, cwd: bridge.cwd, name: 'Synthetic native title', updatedAt: 100 };
     const legacy = { id: 'synthetic-legacy-thread', projectId: null, cwd: bridge.cwd, name: 'Synthetic original desktop title', updatedAt: 200 };

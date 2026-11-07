@@ -40,6 +40,10 @@ lines.on('line', line => {
       break;
     case 'thread/read':
     case 'thread/resume': {
+      if (method === 'thread/resume' && params.threadId === 'writer-conflict-thread') {
+        send({ id, error: { code: -32600, message: 'thread 00000000-0000-4000-8000-000000000000 already has an active writer', data: { privatePath: 'C:\\Users\\example\\private\\synthetic.jsonl' } } });
+        break;
+      }
       const threadId = params.threadId;
       const turn = { id: 'fixture-resumed-turn', status: 'inProgress', items: [] };
       active.set(threadId, turn);
@@ -68,6 +72,10 @@ lines.on('line', line => {
       break;
     case 'turn/start': {
       const mode = params.input?.[0]?.text;
+      if (mode === 'writer-conflict') {
+        send({ id, error: { code: -32600, message: 'thread 00000000-0000-4000-8000-000000000000 already has an active writer', data: { privatePath: 'C:\\Users\\example\\private\\synthetic.jsonl' } } });
+        break;
+      }
       if (mode === 'reject-start') {
         send({ id, error: { code: -32602, message: 'Synthetic request rejection before execution' } });
         break;

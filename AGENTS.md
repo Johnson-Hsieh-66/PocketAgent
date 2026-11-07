@@ -15,6 +15,7 @@ PocketAgent is a private, self-hosted mobile web interface to the local Codex CL
 - Never commit authentication files, cookies, device tokens, pairing codes, prompts, session transcripts, uploads, databases, logs, actual IP addresses, personal paths or company/project data.
 - Tests, screenshots and documentation use synthetic fixtures and placeholder paths only. Do not inspect user credentials for debugging.
 - Diagnostic logs contain only allowlisted metadata and error codes, never raw RPC messages, request bodies, command output or secrets.
+- Write diagnostics directly to the external runtime directory's logs/diagnostics.jsonl; retain at most three 1 MiB files. Allowlist code, component and operation values as well as field names; unknown codes/operations collapse to fixed generic values. Use static route templates and numeric RPC codes, never raw errors, request URLs, identifiers or filesystem paths. Logging failures must not break agent work.
 - Before every commit or push, inspect the full staged diff and run the repository secret check. Do not stage directories wholesale without inspecting the resulting file list.
 - No telemetry, external screenshot uploads or runtime data in CI artifacts. Keep Codex authentication on the server.
 - Network discovery and listener configuration are local runtime data. Never commit real adapter names, addresses, subnets, gateways, MAC addresses or other machine/network metadata; documentation uses LAN/Tailscale placeholders.

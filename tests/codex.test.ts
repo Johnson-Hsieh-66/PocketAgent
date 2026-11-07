@@ -4,13 +4,14 @@ import { tmpdir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { CodexBridge, type SubmissionLedger } from '../src/server/codex.js';
 import type { AppEvent } from '../src/shared/types.js';
+import type { DiagnosticSink } from '../src/server/diagnostics.js';
 
 const fixture = resolve('tests/fixtures/fake-codex.mjs');
 const bridges: CodexBridge[] = [];
 const directories: string[] = [];
 const input = (text = 'hold') => ({ input: [{ type: 'text', text }] });
-async function start(path = fixture, ledger?: SubmissionLedger) {
-  const bridge = new CodexBridge({ command: process.execPath, args: [path] }, ledger);
+async function start(path = fixture, ledger?: SubmissionLedger, diagnostic?: DiagnosticSink) {
+  const bridge = new CodexBridge({ command: process.execPath, args: [path] }, ledger, diagnostic);
   bridges.push(bridge);
   await bridge.start();
   return bridge;
@@ -206,8 +207,33 @@ describe('Codex stdio bridge with a synthetic child', () => {
   });
 
   it('exposes structured RPC failure codes without upstream diagnostic text', async () => {
-    const bridge = await start();
-    await expect(bridge.request('fixture/error')).rejects.toMatchObject({ message: 'CODEX_RPC_ERROR', rpcCode: -32602 });
+    const diagnostic = vi.fn<DiagnosticSink>();
+    const bridge = await start(fixture, undefined, diagnostic);
+    await expect(bridge.request('fixture/error', { syntheticPrivateValue: 'Synthetic request payload stays private' })).rejects.toMatchObject({ message: 'CODEX_RPC_ERROR', rpcCode: -32602 });
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ component: 'codex', code: 'CODEX_RPC_ERROR', operation: 'UNKNOWN_OPERATION', rpcCode: -32602, durationMs: expect.any(Number) }));
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('Synthetic upstream diagnostic');
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('Synthetic request payload stays private');
     expect(JSON.stringify(bridge.eventsSince(0).events)).not.toContain('Synthetic upstream diagnostic');
+  });
+  it('does not let a failing diagnostic callback break agent requests', async () => {
+    const bridge = await start(fixture, undefined, () => { throw new Error('SYNTHETIC_DIAGNOSTIC_FAILURE'); });
+    expect(bridge.status.codex).toBe('ready');
+    await expect(bridge.request('fixture/error')).rejects.toMatchObject({ message: 'CODEX_RPC_ERROR', rpcCode: -32602 });
+    expect(await bridge.request('fixture/stats')).toHaveProperty('starts', 0);
+  });
+  it('classifies writer ownership without retaining upstream identifiers and permits retry after a definite rejection', async () => {
+    const diagnostic = vi.fn<DiagnosticSink>();
+    const { ledger, entries } = memoryLedger();
+    const bridge = await start(fixture, ledger, diagnostic);
+    await expect(bridge.request('thread/resume', { threadId: 'writer-conflict-thread' })).rejects.toMatchObject({ message: 'THREAD_WRITER_CONFLICT', rpcCode: -32600 });
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ code: 'THREAD_WRITER_CONFLICT', operation: 'thread/resume', rpcCode: -32600 }));
+    await expect(bridge.startTurn('writer-rejected-thread', input('writer-conflict'), 'writer-rejected-request')).rejects.toMatchObject({ message: 'THREAD_WRITER_CONFLICT', rpcCode: -32600 });
+    expect(entries.has('writer-rejected-request')).toBe(false);
+    await expect(bridge.startTurn('writer-rejected-thread', input(), 'writer-rejected-request')).resolves.toHaveProperty('turn.id');
+    expect(await bridge.request('fixture/stats')).toHaveProperty('starts', 1);
+    const logs = JSON.stringify(diagnostic.mock.calls);
+    expect(logs).not.toContain('00000000-0000-4000-8000-000000000000');
+    expect(logs).not.toContain('synthetic.jsonl');
+    expect(logs).not.toContain('already has an active writer');
   });
 });

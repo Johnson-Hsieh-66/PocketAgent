@@ -10,9 +10,14 @@ import { buildApp } from './http.js';
 import { resolveCodex } from './launcher.js';
 import { NetworkListeners } from './network.js';
 import { ProjectCatalog } from './projects.js';
+import { createDiagnosticLogger, type DiagnosticSink } from './diagnostics.js';
+
+let writeDiagnostic: DiagnosticSink = createDiagnosticLogger();
 
 async function main() {
 const config = await loadConfig();
+writeDiagnostic = createDiagnosticLogger(config.dataDir);
+writeDiagnostic({ component: 'server', code: 'SERVICE_STARTING', operation: 'startup' });
 await mkdir(config.dataDir, { recursive: true });
 const servicePath = path.join(config.dataDir, 'service.json');
 const lockPath = path.join(config.dataDir, 'service.lock');
@@ -51,10 +56,11 @@ let stopping = false;
 let bridge: CodexBridge | undefined;
 let store: Store | undefined;
 let listeners: NetworkListeners | undefined;
-function diagnostic(code: string) { process.stdout.write(`${JSON.stringify({ time: new Date().toISOString(), code })}\n`); }
+function diagnostic(code: string) { writeDiagnostic({ component: 'server', code, operation: 'startup' }); }
 async function clean() {
   if (stopping) return;
   stopping = true;
+  writeDiagnostic({ component: 'server', code: 'SERVICE_STOPPING', operation: 'shutdown' });
   listeners?.pause();
   listeners?.terminateClients();
   await bridge?.stop().catch(() => {});
@@ -64,6 +70,7 @@ async function clean() {
     try { if (JSON.parse(await readFile(file, 'utf8')).pid === process.pid) await unlink(file); } catch { /* already removed */ }
   }
   if (instanceGuard?.listening) await new Promise<void>(resolve => instanceGuard!.close(() => resolve()));
+  writeDiagnostic({ component: 'server', code: 'SERVICE_STOPPED', operation: 'shutdown' });
 }
 process.on('SIGINT', () => void clean().then(() => process.exit(0)));
 process.on('SIGTERM', () => void clean().then(() => process.exit(0)));
@@ -72,11 +79,13 @@ process.on('unhandledRejection', () => { diagnostic('UNHANDLED_REJECTION'); void
 try {
   if (!stopping) {
     store = new Store(config.dataDir);
-    bridge = new CodexBridge(resolveCodex(config.codexPath), store);
+    bridge = new CodexBridge(resolveCodex(config.codexPath), store, writeDiagnostic);
     const catalog = new ProjectCatalog(config, bridge);
     const files = new Files(config, store, catalog);
-    const shared = { store, bridge, files };
-    listeners = new NetworkListeners(config, host => buildApp({ config: { ...config, host }, ...shared }), { diagnostic });
+    const shared = { store, bridge, files, diagnostic: writeDiagnostic };
+    listeners = new NetworkListeners(config, host => buildApp({ config: { ...config, host }, ...shared }), {
+      diagnostic: code => writeDiagnostic({ component: 'network', code, operation: 'listeners' }),
+    });
     await listeners.start();
     await bridge.start().catch(() => diagnostic('CODEX_UNAVAILABLE'));
     const retry = setInterval(() => { if (!stopping && bridge?.status.codex === 'offline') void bridge.start().catch(() => diagnostic('CODEX_UNAVAILABLE')); }, 30_000);
@@ -85,6 +94,6 @@ try {
 } catch { diagnostic('STARTUP_FAILED'); await clean(); process.exitCode = 1; }
 }
 void main().catch(() => {
-  process.stdout.write(`${JSON.stringify({ time: new Date().toISOString(), code: 'BOOTSTRAP_FAILED' })}\n`);
+  writeDiagnostic({ component: 'server', code: 'BOOTSTRAP_FAILED', operation: 'startup' });
   process.exit(1);
 });
