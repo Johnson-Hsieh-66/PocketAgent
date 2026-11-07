@@ -10,6 +10,7 @@ $RuleDescription = 'PocketAgent managed private-network listener'
 $ProjectDir = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($DataDir)) { $DataDir = Join-Path $env:LOCALAPPDATA 'PocketAgent' }
 $RuntimeDir = [IO.Path]::GetFullPath($DataDir)
+$ResultPath = Join-Path $RuntimeDir 'firewall-result.json'
 if ($RuntimeDir.Equals($ProjectDir, [StringComparison]::OrdinalIgnoreCase) -or
     $RuntimeDir.StartsWith($ProjectDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Runtime data must be outside the repository.'
@@ -20,6 +21,7 @@ if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     $Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Action ' + $Action + ' -DataDir "' + $RuntimeDir + '"'
     try { $Elevated = Start-Process -FilePath $PowerShellPath -ArgumentList $Arguments -Verb RunAs -WindowStyle Hidden -Wait -PassThru }
     catch { throw 'Windows administrator approval is required to manage this firewall rule.' }
+    if (Test-Path -LiteralPath $ResultPath) { Get-Content -LiteralPath $ResultPath -Raw | Write-Output }
     exit $Elevated.ExitCode
 }
 $Existing = Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue
@@ -36,6 +38,12 @@ $ListenerPort = [int]$Settings.port
 if ($ListenerPort -lt 1 -or $ListenerPort -gt 65535) { throw 'Invalid listener port.' }
 $NodePath = @(Get-Command node -CommandType Application -ErrorAction Stop)[0].Source
 if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) { throw 'Node executable not found.' }
+# Windows Filtering Platform matches the executable image, not an NVM junction.
+$PhysicalNodePath = & $NodePath -e "process.stdout.write(require('node:fs').realpathSync(process.execPath))"
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($PhysicalNodePath) -or
+    -not (Test-Path -LiteralPath $PhysicalNodePath -PathType Leaf)) { throw 'Unable to resolve the Node executable image.' }
+$NodeAlias = $NodePath
+$NodePath = [string]$PhysicalNodePath
 $PrivateLocalRanges = @(
     ((10,0,0,0 -join '.') + '/8'),
     ((172,16,0,0 -join '.') + '/12'),
@@ -59,5 +67,23 @@ $Parameters = @{
     Program = $NodePath
 }
 if ($null -ne $Existing) { Remove-NetFirewallRule -Name $RuleName }
-New-NetFirewallRule @Parameters | Out-Null
+$Created = New-NetFirewallRule @Parameters
+$ApplicationFilter = $Created | Get-NetFirewallApplicationFilter
+$PortFilter = $Created | Get-NetFirewallPortFilter
+$AddressFilter = $Created | Get-NetFirewallAddressFilter
+$ActiveRule = Get-NetFirewallRule -PolicyStore ActiveStore -Name $RuleName -ErrorAction SilentlyContinue
+$Profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore)
+$MatchingNodeBlocks = @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Block | ForEach-Object {
+    $Filter = $_ | Get-NetFirewallApplicationFilter
+    if (([string]$Filter.Program).Equals($NodePath,[StringComparison]::OrdinalIgnoreCase) -or
+        ([string]$Filter.Program).Equals($NodeAlias,[StringComparison]::OrdinalIgnoreCase)) { $_ }
+})
+$Verified = ([string]$ApplicationFilter.Program).Equals($NodePath, [StringComparison]::OrdinalIgnoreCase) -and
+    ([string]$PortFilter.LocalPort -eq [string]$ListenerPort) -and
+    ([string]$PortFilter.Protocol -in @('TCP', '6')) -and
+    (@($AddressFilter.RemoteAddress) -notcontains 'Any')
+# Only allowlisted verification metadata is persisted; never executable paths or addresses.
+@{success=$Verified;programImageVerified=([string]$ApplicationFilter.Program).Equals($NodePath,[StringComparison]::OrdinalIgnoreCase);port=$ListenerPort;remoteRestricted=(@($AddressFilter.RemoteAddress) -notcontains 'Any');activeRulePresent=($null -ne $ActiveRule);matchingNodeBlockCount=$MatchingNodeBlocks.Count;localRuleMergeDisabledProfileCount=@($Profiles | Where-Object { [string]$_.AllowLocalFirewallRules -eq 'False' }).Count} |
+    ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultPath -Encoding UTF8
+if (-not $Verified) { throw 'PocketAgent firewall verification failed.' }
 Write-Output 'PocketAgent firewall access is limited to its Node executable, configured TCP port and private network ranges.'
