@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api, applyThreadEvent, errorText, mergeHistory, mergeTurn } from '../src/client/App';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { api, applyThreadEvent, errorText, mergeHistory, mergeTurn, ModelOptions, normalizePairingCode, Pairing } from '../src/client/App';
 import type { AppEvent, Turn } from '../src/shared/types';
 
 const event = (method: string, params: Record<string, unknown>): AppEvent => ({ seq: 1, method, params: { threadId: 'fixture-thread', turnId: 'fixture-turn', ...params } });
@@ -19,10 +21,49 @@ describe('recoverable API errors', () => {
 
   it('gives pairing and access failures a concrete recovery action', () => {
     expect(errorText(new Error('PAIRING_CODE_INVALID_OR_EXPIRED'))).toContain('npm run pair');
+    expect(errorText(new Error('PAIRING_CODE_FORMAT_INVALID'))).toContain('8 位數字');
+    expect(errorText(new Error('DEVICE_NAME_INVALID'))).toContain('裝置名稱');
+    expect(errorText(new Error('HOST_NOT_ALLOWED'))).toContain('區網');
     expect(errorText(new Error('HOST_NOT_ALLOWED'))).toContain('Tailscale IP');
     expect(errorText(new Error('ORIGIN_NOT_ALLOWED'))).toContain('PocketAgent 的服務位址');
     expect(errorText(new Error('THREAD_BUSY'))).toContain('先停止目前的工作');
     expect(errorText(new Error('CODEX_OFFLINE'))).toContain('確認 CLI 狀態');
+  });
+});
+
+describe('pairing input regression', () => {
+  it('renders a fixed eight-digit input and blocks the initially empty submission', () => {
+    const markup = renderToStaticMarkup(createElement(Pairing, { onPaired: vi.fn() }));
+    const input = markup.match(/<input\b[^>]*\bid="pair-code"[^>]*>/)?.[0] || '';
+    const submit = markup.match(/<button\b[^>]*\bclass="button accent pair-button"[^>]*>/)?.[0] || '';
+    expect(input).toMatch(/maxLength="8"/i);
+    expect(input).toMatch(/minLength="8"/i);
+    expect(input).toContain('pattern="[0-9]{8}"');
+    expect(input).toContain('inputMode="numeric"');
+    expect(submit).toMatch(/\bdisabled(?:="")?/);
+  });
+
+  it('preserves leading zeroes and normalizes pasted full-width digits without accepting a ninth digit', () => {
+    expect(normalizePairingCode('012345679')).toBe('01234567');
+    expect(normalizePairingCode('０１２３ ４５６７９')).toBe('01234567');
+    expect(normalizePairingCode('ab０１２３-cd４５６７')).toBe('01234567');
+    expect(normalizePairingCode('0123456')).toHaveLength(7);
+  });
+});
+
+describe('resumed conversation model selection', () => {
+  const models = [{ id: 'catalog-model', model: 'catalog-model', displayName: 'Catalog model' }];
+  const render = (model: string) => renderToStaticMarkup(createElement('select', { value: model, onChange: () => undefined }, createElement(ModelOptions, { models, model })));
+
+  it('keeps a resumed model selected even when it is missing from the current catalog', () => {
+    const markup = render('synthetic-resumed-model');
+    expect(markup).toContain('<option value="synthetic-resumed-model" selected="">synthetic-resumed-model（目前對話）</option>');
+    expect(markup).toContain('<option value="catalog-model">Catalog model</option>');
+    expect(render('catalog-model').match(/value="catalog-model"/g)).toHaveLength(1);
+  });
+
+  it('lets a conversation keep its existing model when resume does not return a model name', () => {
+    expect(render('')).toContain('<option value="" selected="">沿用對話模型</option>');
   });
 });
 

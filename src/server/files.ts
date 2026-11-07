@@ -1,59 +1,63 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, realpath, stat, open, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Attachment, FileEntry, Project } from '../shared/types.js';
 import { isWithin, type AppConfig } from './config.js';
 import { Store, type StoredAttachment } from './store.js';
+import type { ProjectSource } from './projects.js';
 
 export class HttpError extends Error { constructor(public statusCode: number, message: string) { super(message); } }
 const privateName = (name: string) => ['.git', '.codex', '.aws', 'node_modules'].includes(name.toLowerCase()) || /^\.env(?:\.|$)/i.test(name);
-const stableId = (value: string) => createHash('sha256').update(process.platform === 'win32' ? value.toLowerCase() : value).digest('hex').slice(0, 24);
 
 export class Files {
-  constructor(private config: AppConfig, private store: Store) {}
-  async projects(): Promise<Project[]> {
-    const result = new Map<string, Project>();
-    for (const configured of this.config.projectRoots) {
-      let root: string;
-      try { root = await realpath(configured); } catch { continue; }
-      let entries;
-      try { entries = await readdir(root, { withFileTypes: true }); } catch { continue; }
-      for (const entry of entries) {
-        if (entry.name.startsWith('.') || entry.name === 'node_modules' || (!entry.isDirectory() && !entry.isSymbolicLink())) continue;
-        try {
-          const projectPath = await realpath(path.join(root, entry.name));
-          if (!isWithin(root, projectPath) || isWithin(this.config.dataDir, projectPath) || !(await stat(projectPath)).isDirectory()) continue;
-          const id = stableId(projectPath);
-          result.set(id, { id, name: entry.name, path: projectPath });
-        } catch { /* Inaccessible or broken links are omitted. */ }
-      }
-    }
-    return [...result.values()].sort((a, b) => a.name.localeCompare(b.name));
-  }
+  constructor(private config: AppConfig, private store: Store, private source: ProjectSource) {}
+  projects(): Promise<Project[]> { return this.source.projects(); }
   async project(id: string): Promise<Project> {
-    const project = (await this.projects()).find(item => item.id === id);
-    if (!project) throw new HttpError(404, 'PROJECT_NOT_FOUND');
+    const project = this.source.project ? await this.source.project(id) : (await this.projects()).find(item => item.id === id);
+    if (!project || project.id !== id) throw new HttpError(404, 'PROJECT_NOT_FOUND');
     return project;
   }
+  async threadIds(projectId: string): Promise<string[]> { return this.source.threadIds ? this.source.threadIds(projectId) : []; }
+  private roots(project: Project): string[] { return (project.roots?.length ? project.roots : [project.path]).filter(root => path.isAbsolute(root)); }
   async assertThread(projectId: string, cwd: string): Promise<Project> {
     const project = await this.project(projectId);
     let resolved: string;
     try { resolved = await realpath(cwd); } catch { throw new HttpError(403, 'THREAD_OUTSIDE_PROJECT'); }
-    if (!isWithin(project.path, resolved)) throw new HttpError(403, 'THREAD_OUTSIDE_PROJECT');
+    const roots = await Promise.all(this.roots(project).map(root => realpath(root).catch(() => null)));
+    if (!roots.some(root => root !== null && isWithin(root, resolved))) throw new HttpError(403, 'THREAD_OUTSIDE_PROJECT');
     return project;
   }
   private async resolve(projectId: string, relative = ''): Promise<{ project: Project; resolved: string; relative: string }> {
     const project = await this.project(projectId);
     if (path.isAbsolute(relative) || relative.includes('\0') || relative.split(/[\\/]/).some(privateName)) throw new HttpError(403, 'PATH_NOT_ALLOWED');
-    const candidate = path.resolve(project.path, relative);
-    if (!isWithin(project.path, candidate)) throw new HttpError(403, 'PATH_OUTSIDE_PROJECT');
+    const roots = this.roots(project);
+    if (!roots.length) throw new HttpError(403, 'PROJECT_HAS_NO_LOCAL_ROOTS');
+    let selected = 0;
+    let localRelative = relative;
+    let prefix = '';
+    if (roots.length > 1) {
+      const [marker, ...segments] = relative.split(/[\\/]/);
+      const match = /^@root-(0|[1-9]\d*)$/.exec(marker);
+      if (!match || Number(match[1]) >= roots.length) throw new HttpError(403, 'PROJECT_ROOT_REQUIRED');
+      selected = Number(match[1]);
+      localRelative = segments.join(path.sep);
+      prefix = `@root-${selected}`;
+    }
+    let root: string;
+    try { root = await realpath(roots[selected]); } catch { throw new HttpError(404, 'PROJECT_ROOT_UNAVAILABLE'); }
+    const candidate = path.resolve(root, localRelative);
+    if (!isWithin(root, candidate)) throw new HttpError(403, 'PATH_OUTSIDE_PROJECT');
     let resolved: string;
     try { resolved = await realpath(candidate); } catch { throw new HttpError(404, 'FILE_NOT_FOUND'); }
-    if (!isWithin(project.path, resolved) || isWithin(this.config.dataDir, resolved)) throw new HttpError(403, 'PATH_OUTSIDE_PROJECT');
-    if (path.relative(project.path, resolved).split(path.sep).some(privateName)) throw new HttpError(403, 'PATH_NOT_ALLOWED');
-    return { project, resolved, relative: path.relative(project.path, resolved).split(path.sep).join('/') };
+    if (!isWithin(root, resolved) || isWithin(this.config.dataDir, resolved)) throw new HttpError(403, 'PATH_OUTSIDE_PROJECT');
+    if (path.relative(root, resolved).split(path.sep).some(privateName)) throw new HttpError(403, 'PATH_NOT_ALLOWED');
+    const localPath = path.relative(root, resolved).split(path.sep).join('/');
+    return { project, resolved, relative: prefix ? localPath ? `${prefix}/${localPath}` : prefix : localPath };
   }
   async tree(projectId: string, relative = ''): Promise<{ entries: FileEntry[]; path: string }> {
+    const project = await this.project(projectId);
+    const roots = this.roots(project);
+    if (!relative && roots.length > 1) return { path: '', entries: roots.map((root, index) => ({ name: path.basename(root) || root, path: `@root-${index}`, type: 'directory' })) };
     const target = await this.resolve(projectId, relative);
     if (!(await stat(target.resolved)).isDirectory()) throw new HttpError(400, 'NOT_A_DIRECTORY');
     const entries: FileEntry[] = [];

@@ -9,15 +9,34 @@ export interface AppConfig {
   dataDir: string;
   projectRoots: string[];
   codexPath?: string;
+  codexHome?: string;
   staticDir?: string;
   checkoutDir: string;
 }
 
+function ipv4Parts(host: string): number[] | null {
+  const octets = host.split('.');
+  if (octets.length !== 4 || octets.some(octet => !/^(0|[1-9]\d{0,2})$/.test(octet) || Number(octet) > 255)) return null;
+  return octets.map(Number);
+}
+
+export function isLanAddress(host: string): boolean {
+  const parts = ipv4Parts(host);
+  return !!parts && (parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168));
+}
+
+export function isTailscaleAddress(host: string): boolean {
+  const parts = ipv4Parts(host);
+  return !!parts && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
+}
+
+export function isLoopbackAddress(host: string): boolean {
+  const parts = ipv4Parts(host);
+  return !!parts && parts[0] === 127;
+}
+
 export function isAllowedHost(host: string): boolean {
-  if (host === 'tailscale') return true;
-  const parts = host.split('.').map(Number);
-  if (parts.length !== 4 || parts.some((part, i) => !/^\d+$/.test(host.split('.')[i]) || part < 0 || part > 255)) return false;
-  return parts[0] === 127 || (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127);
+  return host === 'private' || host === 'tailscale' || isLanAddress(host) || isTailscaleAddress(host) || isLoopbackAddress(host);
 }
 
 export function isWithin(parent: string, candidate: string): boolean {
@@ -44,14 +63,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (isWithin(checkoutDir, dataDir)) throw new Error('RUNTIME_DIRECTORY_INSIDE_CHECKOUT');
   const configPath = path.join(dataDir, 'config.json');
   if (!existsSync(configPath)) {
-    writeFileSync(configPath, JSON.stringify({ host: 'tailscale', port: 3000, projectRoots: [path.dirname(checkoutDir)] }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+    writeFileSync(configPath, JSON.stringify({ host: 'private', port: 47831 }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   }
   const saved: Record<string, unknown> = JSON.parse(readFileSync(configPath, 'utf8'));
-  const host = env.POCKETAGENT_HOST || (typeof saved.host === 'string' ? saved.host : 'tailscale');
-  const port = Number(env.POCKETAGENT_PORT || saved.port || 3000);
-  if (!isAllowedHost(host)) throw new Error('HOST_MUST_BE_TAILSCALE_OR_LOOPBACK_IPV4');
+  const host = env.POCKETAGENT_HOST || (typeof saved.host === 'string' ? saved.host : 'private');
+  const port = Number(env.POCKETAGENT_PORT || saved.port || 47831);
+  if (!isAllowedHost(host)) throw new Error('HOST_MUST_BE_PRIVATE_OR_LOOPBACK_IPV4');
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('INVALID_PORT');
-  if (!Array.isArray(saved.projectRoots) || !saved.projectRoots.length || saved.projectRoots.some(root => typeof root !== 'string' || !path.isAbsolute(root))) throw new Error('INVALID_PROJECT_ROOTS');
+  if (saved.projectRoots !== undefined && (!Array.isArray(saved.projectRoots) || saved.projectRoots.some(root => typeof root !== 'string' || !path.isAbsolute(root)))) throw new Error('INVALID_PROJECT_ROOTS');
+  const projectRoots = saved.projectRoots === undefined ? [] : saved.projectRoots as string[];
   const codexPath = env.POCKETAGENT_CODEX_PATH || (typeof saved.codexPath === 'string' ? saved.codexPath : undefined);
-  return { host, port, dataDir, checkoutDir, projectRoots: saved.projectRoots as string[], codexPath, staticDir: path.join(checkoutDir, 'dist', 'client') };
+  return { host, port, dataDir, checkoutDir, projectRoots, codexPath, codexHome: path.resolve(env.CODEX_HOME || path.join(os.homedir(), '.codex')), staticDir: path.join(checkoutDir, 'dist', 'client') };
 }

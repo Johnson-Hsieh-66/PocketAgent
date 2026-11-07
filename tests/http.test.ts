@@ -6,6 +6,7 @@ import { EventEmitter, once } from 'node:events';
 import type { FastifyInstance } from 'fastify';
 import type { AppConfig } from '../src/server/config.js';
 import type { AppEvent, PendingRequest, ServiceStatus } from '../src/shared/types.js';
+import type { Project } from '../src/shared/types.js';
 import { Store } from '../src/server/store.js';
 import { Files } from '../src/server/files.js';
 import { buildApp } from '../src/server/http.js';
@@ -21,9 +22,9 @@ class FakeBridge extends EventEmitter {
   interrupt = vi.fn(async () => ({}));
   eventsSince(after: number) { return { events: this.history.filter(event => event.seq > after), reset: after > 100 }; }
   respond(id: string | number, result: unknown) { this.response(id, result); }
-  request = vi.fn(async (method: string, params: any) => {
-    if (method === 'thread/read') return { thread: { id: params.threadId, cwd: this.cwd, preview: 'Synthetic', turns: [] } };
-    if (method === 'thread/list') return { data: [{ id: 'synthetic-thread', cwd: this.cwd, preview: 'Synthetic' }], nextCursor: 'next-synthetic-page' };
+  request = vi.fn<(method: string, params: any) => Promise<any>>(async (method: string, params: any) => {
+    if (method === 'thread/read') return { thread: { id: params.threadId, projectId: 'synthetic-desktop-project', cwd: this.cwd, preview: 'Synthetic', turns: [] } };
+    if (method === 'thread/list') return { data: [{ id: 'synthetic-thread', projectId: 'synthetic-desktop-project', cwd: this.cwd, preview: 'Synthetic' }], nextCursor: 'next-synthetic-page' };
     if (method === 'thread/turns/list') return { data: [{ id: 'synthetic-turn', items: [], status: 'completed' }], nextCursor: null };
     if (method === 'model/list') return { data: [{ id: 'synthetic-model', model: 'synthetic-model', displayName: 'Synthetic' }] };
     return {};
@@ -39,6 +40,8 @@ describe('private HTTP boundary and project access', () => {
   let config: AppConfig;
   let projectId: string;
   let cookie: string;
+  let registeredProjects: Project[];
+  let legacyAssignments: Record<string, string[]>;
   const headers = { host: '127.0.0.1:3000', origin: 'http://127.0.0.1:3000' };
   beforeEach(async () => {
     temp = await mkdtemp(path.join(os.tmpdir(), 'pocketagent-http-test-'));
@@ -49,7 +52,9 @@ describe('private HTTP boundary and project access', () => {
     await writeFile(path.join(project, '.env'), 'SYNTHETIC_ONLY=example');
     config = { host: '127.0.0.1', port: 3000, dataDir: path.join(temp, 'runtime'), checkoutDir: path.join(temp, 'checkout'), projectRoots: [projects] };
     store = new Store(config.dataDir);
-    files = new Files(config, store);
+    registeredProjects = [{ id: 'synthetic-desktop-project', name: 'Synthetic Project', path: project, roots: [project] }];
+    legacyAssignments = {};
+    files = new Files(config, store, { projects: async () => registeredProjects, threadIds: async id => legacyAssignments[id] || [] });
     projectId = (await files.projects())[0].id;
     bridge = new FakeBridge();
     bridge.cwd = project;
@@ -72,6 +77,42 @@ describe('private HTTP boundary and project access', () => {
     expect((await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { host: headers.host, cookie } })).statusCode).toBe(403);
     expect((await app.inject({ url: '/api/projects', headers: { ...headers, cookie } })).json().projects).toHaveLength(1);
   });
+  it('keeps Host, Origin and pairing checks independent on LAN and Tailscale listeners sharing one service', async () => {
+    const hosts = [[192, 168, 50, 42], [100, 70, 50, 42]].map(octets => octets.join('.'));
+    const listeners = await Promise.all(hosts.map(host => buildApp({ config: { ...config, host }, store, files, bridge })));
+    const sockets: Awaited<ReturnType<FastifyInstance['injectWS']>>[] = [];
+    try {
+      await Promise.all(listeners.map(listener => listener.ready()));
+      for (const [index, listener] of listeners.entries()) {
+        const own = { host: `${hosts[index]}:3000`, origin: `http://${hosts[index]}:3000` };
+        const other = { host: `${hosts[1 - index]}:3000`, origin: `http://${hosts[1 - index]}:3000` };
+        expect((await listener.inject({ url: '/api/auth', headers: own })).json()).toEqual({ authenticated: false });
+        expect((await listener.inject({ url: '/api/projects', headers: own })).statusCode).toBe(401);
+        const { code } = store.issuePairCode();
+        const paired = await listener.inject({ method: 'POST', url: '/api/auth/pair', headers: own, payload: { code, deviceName: `Synthetic listener ${index}` } });
+        expect(paired.statusCode).toBe(200);
+        const deviceCookie = `pa_session=${paired.cookies[0].value}`;
+        expect((await listener.inject({ url: '/api/projects', headers: { ...own, cookie: deviceCookie } })).statusCode).toBe(200);
+        expect((await listener.inject({ url: '/api/projects', headers: { ...own, host: other.host, cookie: deviceCookie } })).statusCode).toBe(403);
+        expect((await listener.inject({ url: '/api/projects', headers: { ...own, origin: other.origin, cookie: deviceCookie } })).statusCode).toBe(403);
+        await expect(listener.injectWS('/api/events', { headers: own })).rejects.toThrow('401');
+        await expect(listener.injectWS('/api/events', { headers: { ...own, origin: other.origin, cookie: deviceCookie } })).rejects.toThrow('403');
+        await expect(listener.injectWS('/api/events', { headers: { ...own, host: other.host, cookie: deviceCookie } })).rejects.toThrow('403');
+        sockets.push(await listener.injectWS('/api/events', { headers: { ...own, cookie: deviceCookie } }));
+      }
+      const received = sockets.map(socket => once(socket, 'message'));
+      bridge.emit('event', { seq: 1, method: 'synthetic/shared-event', params: {} });
+      for (const [message] of await Promise.all(received)) expect(JSON.parse(message.toString()).method).toBe('synthetic/shared-event');
+      store.revoke('all');
+      for (const [index, listener] of listeners.entries()) {
+        expect((await listener.inject({ url: '/api/projects', headers: { host: `${hosts[index]}:3000`, cookie } })).statusCode).toBe(401);
+      }
+    } finally {
+      for (const socket of sockets) socket.terminate();
+      await new Promise(resolve => setTimeout(resolve, 10));
+      await Promise.all(listeners.map(listener => listener.close()));
+    }
+  });
   it('uses one-time pairing codes and immediately revokes device sessions', async () => {
     const { code } = store.issuePairCode();
     const result = store.pair(code, 'Synthetic second device');
@@ -83,6 +124,61 @@ describe('private HTTP boundary and project access', () => {
     const logout = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...headers, cookie } });
     expect(logout.statusCode).toBe(200);
     expect((await app.inject({ url: '/api/status', headers: { ...headers, cookie } })).statusCode).toBe(401);
+  });
+  it('accepts copied separators and fullwidth pairing digits without changing code identity', async () => {
+    const formats = [
+      (code: string) => ` ${code} `,
+      (code: string) => `${code.slice(0, 4)}-${code.slice(4)}`,
+      (code: string) => Array.from(code, digit => String.fromCharCode(digit.charCodeAt(0) + 0xFEE0)).join(''),
+    ];
+    for (const format of formats) {
+      const { code } = store.issuePairCode();
+      const response = await app.inject({ method: 'POST', url: '/api/auth/pair', headers, payload: { code: format(code), deviceName: 'Synthetic copied-code device' } });
+      expect(response.json()).toEqual({ authenticated: true });
+      expect(response.statusCode).toBe(200);
+      const reused = await app.inject({ method: 'POST', url: '/api/auth/pair', headers, payload: { code, deviceName: 'Synthetic reuse' } });
+      expect(reused.json()).toEqual({ error: 'PAIRING_CODE_INVALID_OR_EXPIRED' });
+    }
+  });
+  it('distinguishes malformed pairing codes from incorrect, expired and locked codes', async () => {
+    const { code } = store.issuePairCode();
+    for (const invalidCode of ['', code.slice(0, 7), code + '0', `Pairing code: ${code}`, 12345678]) {
+      const response = await app.inject({ method: 'POST', url: '/api/auth/pair', headers, payload: { code: invalidCode, deviceName: 'Synthetic invalid format' } });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toEqual({ error: 'PAIRING_CODE_FORMAT_INVALID' });
+    }
+    const incorrect = (code.startsWith('0') ? '1' : '0') + code.slice(1);
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const response = await app.inject({ method: 'POST', url: '/api/auth/pair', headers, payload: { code: incorrect, deviceName: 'Synthetic incorrect code' } });
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ error: 'PAIRING_CODE_INVALID_OR_EXPIRED' });
+    }
+    const locked = await app.inject({ method: 'POST', url: '/api/auth/pair', headers, payload: { code, deviceName: 'Synthetic locked code' } });
+    expect(locked.json()).toEqual({ error: 'PAIRING_CODE_INVALID_OR_EXPIRED' });
+    const expiry = store.issuePairCode();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(expiry.expiresAt + 1);
+    try {
+      const expired = await app.inject({ method: 'POST', url: '/api/auth/pair', headers, payload: { code: expiry.code, deviceName: 'Synthetic expired code' } });
+      expect(expired.statusCode).toBe(401);
+      expect(expired.json()).toEqual({ error: 'PAIRING_CODE_INVALID_OR_EXPIRED' });
+    } finally { clock.mockRestore(); }
+  });
+  it('allows an optional blank device name and completes the exact UI pairing and initial workspace requests', async () => {
+    for (const deviceName of [undefined, '   ', '我的裝置']) {
+      const { code } = store.issuePairCode();
+      const paired = await app.inject({ method: 'POST', url: '/api/auth/pair', headers, payload: { code, ...(deviceName === undefined ? {} : { deviceName }) } });
+      expect(paired.statusCode).toBe(200);
+      expect(paired.json()).toEqual({ authenticated: true });
+      const pairedCookie = `pa_session=${paired.cookies[0].value}`;
+      const bootstrap = await Promise.all(['/api/auth', '/api/projects', '/api/status', '/api/models', '/api/requests', `/api/threads?projectId=${projectId}`].map(url => app.inject({ url, headers: { ...headers, cookie: pairedCookie } })));
+      for (const response of bootstrap) {
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).not.toHaveProperty('error');
+      }
+    }
+    expect(store.devices().filter(device => device.name === '我的裝置')).toHaveLength(3);
+    const malformedBody = await app.inject({ method: 'POST', url: '/api/auth/pair', headers, payload: [] });
+    expect(malformedBody.statusCode).toBe(400);
   });
   it('bounds previews and blocks traversal, sensitive paths, binaries and escaping links', async () => {
     const tree = await files.tree(projectId);
@@ -108,7 +204,7 @@ describe('private HTTP boundary and project access', () => {
     const response = await app.inject({ url: `/api/threads?projectId=${projectId}&cursor=synthetic-cursor`, headers: { ...headers, cookie } });
     expect(response.statusCode).toBe(200);
     expect(response.json().nextCursor).toBe('next-synthetic-page');
-    expect(bridge.request).toHaveBeenCalledWith('thread/list', expect.objectContaining({ cwd: bridge.cwd, cursor: 'synthetic-cursor', modelProviders: [], sourceKinds: ['cli', 'vscode', 'appServer'] }));
+    expect(bridge.request).toHaveBeenCalledWith('thread/list', expect.objectContaining({ projectId, cursor: 'synthetic-cursor', modelProviders: [], sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'] }));
     const history = await app.inject({ url: `/api/threads/synthetic-thread/turns?projectId=${projectId}`, headers: { ...headers, cookie } });
     expect(history.statusCode).toBe(200);
     expect(bridge.request).toHaveBeenCalledWith('thread/turns/list', expect.objectContaining({ itemsView: 'full' }));
@@ -120,6 +216,47 @@ describe('private HTTP boundary and project access', () => {
     expect(interruption.statusCode).toBe(403);
     expect(bridge.interrupt).not.toHaveBeenCalled();
   });
+  it('reuses original desktop thread identities and merges only assigned legacy history on the first page', async () => {
+    const native = { id: 'synthetic-native-thread', projectId, cwd: bridge.cwd, name: 'Synthetic native title', updatedAt: 100 };
+    const legacy = { id: 'synthetic-legacy-thread', projectId: null, cwd: bridge.cwd, name: 'Synthetic original desktop title', updatedAt: 200 };
+    const unassigned = { id: 'synthetic-unassigned-thread', projectId: null, cwd: bridge.cwd, name: 'Synthetic unrelated CLI title', updatedAt: 300 };
+    const wrongProject = { id: 'synthetic-cross-project-thread', projectId: 'synthetic-other-official-project', cwd: bridge.cwd, updatedAt: 400 };
+    legacyAssignments[projectId] = [legacy.id, native.id, 'synthetic-unavailable-thread', wrongProject.id];
+    bridge.request.mockImplementation(async (method: string, rpcParams: any) => {
+      if (method === 'thread/list') return { data: [native, unassigned, wrongProject], nextCursor: 'synthetic-native-next-page' };
+      if (method === 'thread/read') {
+        const thread = [native, legacy, unassigned, wrongProject].find(item => item.id === rpcParams.threadId);
+        if (!thread) throw new Error('CODEX_RPC_ERROR');
+        return { thread };
+      }
+      return {};
+    });
+    const first = await app.inject({ url: `/api/threads?projectId=${projectId}`, headers: { ...headers, cookie } });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().data.map((thread: any) => ({ id: thread.id, name: thread.name }))).toEqual([
+      { id: legacy.id, name: 'Synthetic original desktop title' },
+      { id: native.id, name: 'Synthetic native title' },
+    ]);
+    expect(first.json().nextCursor).toBe('synthetic-native-next-page');
+    expect(bridge.request).toHaveBeenCalledWith('thread/list', expect.objectContaining({ projectId, sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'] }));
+    const nativeListCall = bridge.request.mock.calls.find(call => call[0] === 'thread/list');
+    expect(nativeListCall?.[1]).not.toHaveProperty('cwd');
+    bridge.request.mockClear();
+    const next = await app.inject({ url: `/api/threads?projectId=${projectId}&cursor=synthetic-native-next-page`, headers: { ...headers, cookie } });
+    expect(next.json().data.map((thread: any) => thread.id)).toEqual([native.id]);
+    expect(bridge.request.mock.calls.some(call => call[0] === 'thread/read')).toBe(false);
+    for (const threadId of [unassigned.id, wrongProject.id]) {
+      const response = await app.inject({ url: `/api/threads/${threadId}?projectId=${projectId}`, headers: { ...headers, cookie } });
+      expect(response.statusCode).toBe(403);
+      expect(response.json()).toEqual({ error: 'THREAD_NOT_IN_PROJECT' });
+    }
+    const resumed = await app.inject({ method: 'POST', url: `/api/threads/${legacy.id}/resume`, headers: { ...headers, cookie }, payload: { projectId } });
+    expect(resumed.statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/resume', expect.objectContaining({ threadId: legacy.id, excludeTurns: true }));
+    const created = await app.inject({ method: 'POST', url: '/api/threads', headers: { ...headers, cookie }, payload: { projectId } });
+    expect(created.statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/start', expect.objectContaining({ projectId, cwd: bridge.cwd }));
+  });
   it('accepts bounded real image types and routes only project-owned server image paths', async () => {
     const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
     await expect(files.upload(projectId, 'unsafe.svg', 'image/svg+xml', Buffer.from('<svg/>'))).rejects.toMatchObject({ statusCode: 415 });
@@ -129,6 +266,7 @@ describe('private HTTP boundary and project access', () => {
     expect(bridge.startTurn).toHaveBeenCalledWith('synthetic-thread', expect.objectContaining({ input: [{ type: 'localImage', path: path.join(config.dataDir, 'uploads', uploaded.id) }] }), 'synthetic-upload-request');
     const otherDir = path.join(config.projectRoots[0], 'Other Synthetic Project');
     await mkdir(otherDir);
+    registeredProjects.push({ id: 'synthetic-other-project', name: 'Other Synthetic Project', path: otherDir, roots: [otherDir] });
     const otherId = (await files.projects()).find(project => project.name === 'Other Synthetic Project')!.id;
     await expect(files.attachment(uploaded.id, otherId)).rejects.toMatchObject({ statusCode: 404 });
     const preview = await app.inject({ url: `/api/uploads/${uploaded.id}`, headers: { ...headers, cookie } });

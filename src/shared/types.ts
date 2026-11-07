@@ -1,4 +1,4 @@
-export interface Project { id: string; name: string; path: string }
+export interface Project { id: string; name: string; path: string; roots?: string[] }
 export interface FileEntry { name: string; path: string; type: 'file' | 'directory'; size?: number }
 export interface Thread { id: string; name?: string | null; preview: string; cwd: string; updatedAt: number; status?: { type: string }; turns?: Turn[] }
 export interface Turn { id: string; status: string; items: ThreadItem[]; error?: { message?: string } | null }

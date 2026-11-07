@@ -53,7 +53,9 @@ const errorMessages: Record<string, string> = {
   CODEX_OFFLINE: 'Codex 目前未連線。請在電腦上確認 CLI 狀態，再重新連線。',
   REQUEST_ID_CONFLICT: '這則訊息與先前送出的內容不一致。請確認內容並編輯後重新傳送。',
   PAIRING_CODE_INVALID_OR_EXPIRED: '配對碼無效或已過期。請在電腦執行 npm run pair 取得新碼。',
-  HOST_NOT_ALLOWED: '這個服務位址未獲允許。請使用已設定的 Tailscale IP 開啟網頁。',
+  PAIRING_CODE_FORMAT_INVALID: '配對碼必須是 8 位數字，請確認後再試一次。',
+  DEVICE_NAME_INVALID: '請輸入有效的裝置名稱，不能只包含空白。',
+  HOST_NOT_ALLOWED: '這個服務位址未獲允許。請使用已設定的區網或 Tailscale IP 開啟網頁。',
   ORIGIN_REQUIRED: '請直接使用 PocketAgent 的服務位址開啟網頁，再重新操作。',
   ORIGIN_NOT_ALLOWED: '這個網頁來源未獲允許。請直接使用 PocketAgent 的服務位址。',
 };
@@ -73,6 +75,14 @@ function dateLabel(seconds: number) {
   return date.toDateString() === now.toDateString()
     ? date.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false })
     : date.toLocaleDateString('zh-TW', { month: 'numeric', day: 'numeric' });
+}
+
+export function ModelOptions({ models, model }: { models: Model[]; model: string }) {
+  return <>
+    {model && !models.some(entry => entry.model === model) ? <option value={model}>{model}（目前對話）</option> : null}
+    {!model ? <option value="">{models.length ? '沿用對話模型' : '預設模型'}</option> : null}
+    {models.map(entry => <option value={entry.model} key={entry.id}>{entry.displayName || entry.model}</option>)}
+  </>;
 }
 
 const terminalStatus = (status: string) => ['completed', 'failed', 'interrupted'].includes(status);
@@ -195,16 +205,22 @@ function PendingCard({ request, onRespond }: { request: PendingRequest; onRespon
   </section>;
 }
 
-function Pairing({ onPaired }: { onPaired: () => void }) {
+export const normalizePairingCode = (value: string) => value.normalize('NFKC').replace(/\D/g, '').slice(0, 8);
+
+export function Pairing({ onPaired }: { onPaired: () => void }) {
   const [code, setCode] = useState('');
   const [deviceName, setDeviceName] = useState('我的裝置');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const submit = async (event: FormEvent) => {
-    event.preventDefault(); setBusy(true); setError('');
-    try { await api('/auth/pair', { method: 'POST', body: body({ code: code.replace(/\s/g, ''), deviceName }) }); onPaired(); } catch (reason) { setError(errorText(reason)); } finally { setBusy(false); }
+    event.preventDefault();
+    if (busy) return;
+    if (!/^[0-9]{8}$/.test(code)) { setError(errorText(new Error('PAIRING_CODE_FORMAT_INVALID'))); return; }
+    if (!deviceName.trim()) { setError(errorText(new Error('DEVICE_NAME_INVALID'))); return; }
+    setBusy(true); setError('');
+    try { await api('/auth/pair', { method: 'POST', body: body({ code, deviceName: deviceName.trim() }) }); onPaired(); } catch (reason) { setError(errorText(reason)); } finally { setBusy(false); }
   };
-  return <div className="pairing-screen"><div className="pairing-decoration" /><header className="pairing-brand"><Mark /><strong>PocketAgent<span>你的工作，隨身接續。</span></strong></header><main className="pairing-card"><div className="eyebrow"><span className="status-dot online" /> PRIVATE WORKSPACE</div><h1>連上你的<br /><em>工作空間。</em></h1><p className="pairing-description">與這台電腦配對，從手機接續 Codex 的每一項工作。</p><form onSubmit={(event) => void submit(event)}><label htmlFor="pair-code">一次性配對碼</label><input id="pair-code" className="code-input" autoComplete="one-time-code" inputMode="numeric" placeholder="輸入配對碼" value={code} onChange={(event) => setCode(event.target.value)} required autoFocus maxLength={32} /><label htmlFor="device-name">裝置名稱</label><input id="device-name" value={deviceName} onChange={(event) => setDeviceName(event.target.value)} maxLength={64} required />{error ? <p className="inline-error" role="alert">{error}</p> : null}<button className="button accent pair-button" disabled={busy}>{busy ? '正在配對…' : '配對這個裝置'}<Icon name="arrow" size={18} /></button></form><div className="pair-help"><Icon name="terminal" size={16} /><p>在電腦的 PocketAgent 目錄執行 <code>npm run pair</code> 取得配對碼。</p></div><footer><Icon name="shield" size={14} />配對碼 10 分鐘內有效 · 裝置驗證保留 30 天</footer></main><div className="pairing-bottom">LOCAL COMPUTE. ANYWHERE YOU ARE.</div></div>;
+  return <div className="pairing-screen"><div className="pairing-decoration" /><header className="pairing-brand"><Mark /><strong>PocketAgent<span>你的工作，隨身接續。</span></strong></header><main className="pairing-card"><div className="eyebrow"><span className="status-dot online" /> PRIVATE WORKSPACE</div><h1>連上你的<br /><em>工作空間。</em></h1><p className="pairing-description">與這台電腦配對，從手機接續 Codex 的每一項工作。</p><form onSubmit={(event) => void submit(event)}><label htmlFor="pair-code">一次性配對碼</label><input id="pair-code" className="code-input" autoComplete="one-time-code" inputMode="numeric" placeholder="輸入配對碼" value={code} onChange={(event) => setCode(normalizePairingCode(event.target.value))} onPaste={(event) => { event.preventDefault(); setCode(normalizePairingCode(event.clipboardData.getData('text'))); }} required autoFocus maxLength={8} minLength={8} pattern="[0-9]{8}" /><label htmlFor="device-name">裝置名稱</label><input id="device-name" value={deviceName} onChange={(event) => setDeviceName(event.target.value)} maxLength={64} required />{error ? <p className="inline-error" role="alert">{error}</p> : null}<button className="button accent pair-button" disabled={busy || !/^[0-9]{8}$/.test(code) || !deviceName.trim()}>{busy ? '正在配對…' : '配對這個裝置'}<Icon name="arrow" size={18} /></button></form><div className="pair-help"><Icon name="terminal" size={16} /><p>在電腦的 PocketAgent 目錄執行 <code>npm run pair</code> 取得配對碼。</p></div><footer><Icon name="shield" size={14} />配對碼 10 分鐘內有效 · 裝置驗證保留 30 天</footer></main><div className="pairing-bottom">LOCAL COMPUTE. ANYWHERE YOU ARE.</div></div>;
 }
 
 function FileBrowser({ project, onClose }: { project: Project; onClose: () => void }) {
@@ -231,6 +247,8 @@ function FileBrowser({ project, onClose }: { project: Project; onClose: () => vo
 export function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [projectId, setProjectId] = useState('');
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadCursor, setThreadCursor] = useState<string | null>(null);
@@ -262,11 +280,14 @@ export function App() {
   const followRef = useRef(true);
   const submissionRef = useRef<{ fingerprint: string; requestId: string } | null>(null);
   const viewEpochRef = useRef(0);
+  const projectsRequestRef = useRef(0);
   const project = projects.find((entry) => entry.id === projectId);
   const selectedThread = threads.find((entry) => entry.id === threadId);
   const isWorking = turns.some((turn) => ['inProgress', 'running', 'active'].includes(turn.status)) || selectedThread?.status?.type === 'active';
   const currentRequests = requests.filter((request) => string(request.params.threadId) === threadId || (!request.params.threadId && !!threadId));
   const itemCount = turns.reduce((count, turn) => count + turn.items.length, 0);
+  const waitingForProjects = !project && (projectsLoading || !projectsLoaded);
+  const catalogLoadingText = status.codex !== 'ready' ? '正在等待 Codex 就緒…' : projectsLoading ? '正在讀取 Codex 專案…' : '暫時無法讀取 Codex 專案，請重新整理網頁。';
 
   useEffect(() => { threadRef.current = threadId; }, [threadId]);
   useEffect(() => { projectRef.current = projectId; }, [projectId]);
@@ -274,6 +295,20 @@ export function App() {
   useEffect(() => { const element = composerRef.current; if (element) { element.style.height = 'auto'; element.style.height = `${Math.min(element.scrollHeight, 180)}px`; } }, [text]);
 
   const refreshRequests = useCallback(async () => { try { setRequests((await api<{ requests: PendingRequest[] }>('/requests')).requests); } catch { /* Reconnection performs the next refresh. */ } }, []);
+  const refreshProjects = useCallback(async () => {
+    const request = ++projectsRequestRef.current;
+    setProjectsLoading(true);
+    try {
+      const data = await api<{ projects: Project[] }>('/projects');
+      if (request !== projectsRequestRef.current) return;
+      setProjects(data.projects);
+      setProjectsLoaded(true);
+      setError(previous => previous === errorText(new Error('CODEX_OFFLINE')) ? '' : previous);
+      const next = data.projects.some(entry => entry.id === projectRef.current) ? projectRef.current : data.projects[0]?.id || '';
+      if (next !== projectRef.current) { projectRef.current = next; setProjectId(next); }
+    } catch (reason) { if (request === projectsRequestRef.current) throw reason; }
+    finally { if (request === projectsRequestRef.current) setProjectsLoading(false); }
+  }, []);
   const refreshHistory = useCallback(async (id: string, pid: string) => {
     const data = await api<{ data: Turn[]; nextCursor?: string | null }>(`/threads/${encodeURIComponent(id)}/turns?projectId=${encodeURIComponent(pid)}`);
     if (threadRef.current === id && projectRef.current === pid) { setTurns((live) => mergeHistory([...data.data].reverse(), live)); setHistoryCursor(data.nextCursor || null); }
@@ -296,18 +331,19 @@ export function App() {
     if (!authenticated) return;
     let live = true;
     void Promise.allSettled([
-      api<{ projects: Project[] }>('/projects').then((data) => { if (live) { setProjects(data.projects); const first = data.projects[0]?.id || ''; setProjectId(first); projectRef.current = first; } }),
+      refreshProjects(),
       api<ServiceStatus>('/status').then((data) => { if (live) setStatus(data); }),
       api<{ data: Model[] }>('/models').then((data) => { if (live) { setModels(data.data); setModel((previous) => previous || (data.data.find((entry) => entry.isDefault) || data.data[0])?.model || ''); } }),
       refreshRequests(),
     ]).then((results) => { if (live) { const failure = results.find((result) => result.status === 'rejected'); if (failure?.status === 'rejected') setError(errorText(failure.reason)); } });
     return () => { live = false; };
-  }, [authenticated, refreshRequests]);
+  }, [authenticated, refreshRequests, refreshProjects]);
 
   useEffect(() => {
-    if (!projectId || !authenticated) return;
+    if (!authenticated) return;
     viewEpochRef.current += 1;
     setLoading(true); setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false);
+    if (!projectId) { setLoading(false); return; }
     let live = true;
     void loadThreads(projectId).catch((reason) => { if (live) setError(errorText(reason)); }).finally(() => { if (live) setLoading(false); });
     return () => { live = false; };
@@ -316,15 +352,17 @@ export function App() {
   useEffect(() => {
     if (!authenticated || status.codex !== 'ready') return;
     let live = true;
+    void refreshProjects().catch(reason => { if (live) setError(errorText(reason)); });
     void api<{ data: Model[] }>('/models').then((data) => { if (live) { setModels(data.data); setModel((previous) => previous || (data.data.find((entry) => entry.isDefault) || data.data[0])?.model || ''); } }).catch(() => undefined);
     if (projectRef.current) void loadThreads(projectRef.current).catch(() => undefined);
     return () => { live = false; };
-  }, [authenticated, status.codex, loadThreads]);
+  }, [authenticated, status.codex, loadThreads, refreshProjects]);
 
   useEffect(() => {
     if (!authenticated) return;
     let closed = false; let socket: WebSocket | undefined; let timer: ReturnType<typeof setTimeout>; let attempts = 0;
     const resync = () => {
+      void refreshProjects().catch(reason => { if (!closed) setError(errorText(reason)); });
       void refreshRequests();
       const id = threadRef.current; const pid = projectRef.current;
       if (id && pid) void refreshHistory(id, pid).catch(() => undefined);
@@ -345,6 +383,10 @@ export function App() {
         if (event.method === 'pocketagent/reset') { sequenceRef.current = event.seq || 0; resync(); return; }
         if (event.method === 'pocketagent/status') { setStatus((params.status || params) as unknown as ServiceStatus); return; }
         if (event.method === 'pocketagent/requests') { if (Array.isArray(params.requests)) setRequests(params.requests as PendingRequest[]); return; }
+        if (event.method === 'project/changed') {
+          void refreshProjects().then(() => { const pid = projectRef.current; if (pid && !closed) void loadThreads(pid).catch(reason => setError(errorText(reason))); }).catch(reason => { if (!closed) setError(errorText(reason)); });
+          return;
+        }
         if (event.method.includes('requestApproval') || event.method.includes('requestUserInput') || event.method.includes('elicitation') || event.method === 'serverRequest/resolved') void refreshRequests();
         if (event.method === 'thread/name/updated') setThreads((previous) => previous.map((entry) => entry.id === string(params.threadId) ? { ...entry, name: string(params.threadName) || string(params.name) } : entry));
         if (event.method === 'thread/status/changed') setThreads((previous) => previous.map((entry) => entry.id === string(params.threadId) ? { ...entry, status: object(params.status) as { type: string } } : entry));
@@ -363,16 +405,55 @@ export function App() {
     };
     connect();
     return () => { closed = true; clearTimeout(timer); socket?.close(); };
-  }, [authenticated, loadThreads, refreshHistory, refreshRequests]);
+  }, [authenticated, loadThreads, refreshHistory, refreshRequests, refreshProjects]);
+
+  useEffect(() => {
+    if (!authenticated || status.codex !== 'ready') return;
+    let live = true;
+    let inFlight = false;
+    const refreshVisibleCatalog = async (includeHistory: boolean) => {
+      if (!live || inFlight || document.visibilityState === 'hidden') return;
+      inFlight = true;
+      const previousProject = projectRef.current;
+      const previousThread = threadRef.current;
+      try {
+        await refreshProjects();
+        if (!live) return;
+        const pid = projectRef.current;
+        if (pid) await loadThreads(pid);
+        if (live && includeHistory && pid && pid === previousProject && previousThread && previousThread === threadRef.current) await refreshHistory(previousThread, pid);
+      } catch { /* A later focus, poll or stream event retries these read-only requests. */ }
+      finally { inFlight = false; }
+    };
+    const onFocus = () => { void refreshVisibleCatalog(true); };
+    const onVisibility = () => { if (document.visibilityState === 'visible') onFocus(); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    const timer = setInterval(() => { void refreshVisibleCatalog(false); }, 30_000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [authenticated, status.codex, refreshProjects, loadThreads, refreshHistory]);
 
   const chooseThread = async (entry: Thread) => {
-    viewEpochRef.current += 1;
+    const epoch = ++viewEpochRef.current;
+    const selectedProject = projectId;
+    const isCurrentView = () => epoch === viewEpochRef.current && threadRef.current === entry.id && projectRef.current === selectedProject;
     setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); setLoading(true); setError(''); setAttachments([]); followRef.current = true;
-    try { await api(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId }) }); await refreshHistory(entry.id, projectId); await refreshRequests(); } catch (reason) { if (threadRef.current === entry.id) setError(errorText(reason)); } finally { if (threadRef.current === entry.id) setLoading(false); }
+    try {
+      const resumed = await api<{ thread: Thread; model?: string }>(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId: selectedProject }) });
+      if (!isCurrentView()) return;
+      setModel(typeof resumed.model === 'string' ? resumed.model : '');
+      await refreshHistory(entry.id, selectedProject);
+      await refreshRequests();
+    } catch (reason) { if (isCurrentView()) setError(errorText(reason)); } finally { if (isCurrentView()) setLoading(false); }
   };
   const newThread = () => { viewEpochRef.current += 1; setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
   const send = async () => {
-    if ((!text.trim() && !attachments.length) || sending || isWorking || !projectId || status.codex !== 'ready' || status.authenticated === false) return;
+    if ((!text.trim() && !attachments.length) || sending || loading || isWorking || !projectId || status.codex !== 'ready' || status.authenticated === false) return;
     const epoch = viewEpochRef.current;
     const sendProject = projectId;
     const sentText = text;
@@ -436,24 +517,24 @@ export function App() {
   return <div className="app-shell">
     {sidebarOpen ? <button className="sidebar-backdrop" aria-label="收起選單" onClick={() => setSidebarOpen(false)} /> : null}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}><header className="brand"><Mark /><div><strong>PocketAgent</strong><span>你的工作，隨身接續。</span></div><button className="icon-button sidebar-close" aria-label="關閉選單" onClick={() => setSidebarOpen(false)}><Icon name="close" /></button></header>
-      <div className="project-label">工作空間 <span>WORKSPACE</span></div><div className="project-picker"><Icon name="folder" size={19} /><select aria-label="切換專案" value={projectId} onChange={(event) => { projectRef.current = event.target.value; setProjectId(event.target.value); }}>{projects.length ? projects.map((entry) => <option value={entry.id} key={entry.id}>{entry.name}</option>) : <option value="">尚無可用專案</option>}</select><Icon name="chevron" size={13} /></div>
+      <div className="project-label">Codex 專案 <span>PROJECTS</span></div><div className="project-picker"><Icon name="folder" size={19} /><select aria-label="切換 Codex 專案" aria-busy={projectsLoading} disabled={waitingForProjects} value={projectId} onChange={(event) => { projectRef.current = event.target.value; setProjectId(event.target.value); }}>{projects.length ? projects.map((entry) => <option value={entry.id} key={entry.id}>{entry.name}</option>) : <option value="">{waitingForProjects ? catalogLoadingText : '尚無 Codex 專案'}</option>}</select><Icon name="chevron" size={13} /></div>
       <button className="new-thread-button" onClick={newThread} disabled={!projectId}><Icon name="plus" size={18} />新增對話<span>＋</span></button>
       <div className="session-label">最近的對話<button className="icon-button" aria-label="重新整理對話" onClick={() => void loadThreads(projectId).catch((reason) => setError(errorText(reason)))} disabled={!projectId}><Icon name="refresh" size={14} /></button></div>
-      <nav className="session-list" aria-label="對話紀錄">{threads.map((entry) => <button className={`session-row ${entry.id === threadId ? 'active' : ''}`} key={entry.id} onClick={() => void chooseThread(entry)}><Icon name="chat" size={16} /><span><strong>{entry.name || entry.preview || '新的對話'}</strong><small>{entry.status?.type === 'active' ? <><span className="status-dot online" />執行中</> : entry.id === threadId ? '目前的對話' : '點選以接續工作'}</small></span><time>{dateLabel(entry.updatedAt)}</time>{requests.some((request) => request.params.threadId === entry.id) ? <span className="request-dot" title="等待回覆" /> : null}</button>)}{!threads.length ? <div className="no-sessions"><Icon name="chat" size={25} /><p>{loading ? '正在讀取對話…' : '從一個新對話開始。'}<br /><span>{loading ? '稍候就能接續工作' : '這個專案的 CLI 紀錄也會出現在這裡。'}</span></p></div> : null}{threadCursor ? <button className="load-more" onClick={() => void loadThreads(projectId, threadCursor).catch((reason) => setError(errorText(reason)))}>載入更早的對話</button> : null}</nav>
+      <nav className="session-list" aria-label="對話紀錄">{threads.map((entry) => <button className={`session-row ${entry.id === threadId ? 'active' : ''}`} key={entry.id} onClick={() => void chooseThread(entry)}><Icon name="chat" size={16} /><span><strong>{entry.name || entry.preview || '新的對話'}</strong><small>{entry.status?.type === 'active' ? <><span className="status-dot online" />執行中</> : entry.id === threadId ? '目前的對話' : '點選以接續工作'}</small></span><time>{dateLabel(entry.updatedAt)}</time>{requests.some((request) => request.params.threadId === entry.id) ? <span className="request-dot" title="等待回覆" /> : null}</button>)}{!threads.length ? <div className="no-sessions"><Icon name="chat" size={25} /><p>{waitingForProjects ? catalogLoadingText : loading ? '正在讀取對話…' : '從一個新對話開始。'}<br /><span>{loading || waitingForProjects ? '稍候就能接續工作' : '這個 Codex 專案的對話會出現在這裡。'}</span></p></div> : null}{threadCursor ? <button className="load-more" onClick={() => void loadThreads(projectId, threadCursor).catch((reason) => setError(errorText(reason)))}>載入更早的對話</button> : null}</nav>
       <footer className="sidebar-footer"><div className="private-connection"><span className="connection-glyph"><Icon name="shield" size={17} /></span><div><strong>私人工作空間</strong><span>{connection === 'connected' ? '裝置已配對 · 私人連線' : '正在恢復連線…'}</span></div><span className={`status-dot ${connection === 'connected' ? 'online' : ''}`} /></div><button className="logout-button" onClick={() => void logout()}><Icon name="logout" size={15} />取消此裝置的登入</button></footer>
     </aside>
-    <main className="workspace"><header className="workspace-header"><div className="workspace-breadcrumb"><button className="icon-button mobile-menu" aria-label="開啟專案與對話" onClick={() => setSidebarOpen(true)}><Icon name="menu" size={20} /></button><span className="breadcrumb-project">{project?.name || '工作空間'}</span><span className="breadcrumb-divider">/</span><span className="breadcrumb-thread">{selectedThread?.name || selectedThread?.preview || '新的對話'}</span></div><div className="workspace-actions"><span className={`service-pill ${status.codex === 'ready' ? 'ready' : ''}`}><span className={`status-dot ${status.codex === 'ready' ? 'online' : ''}`} /><span>{status.codex === 'ready' ? 'Codex 已就緒' : status.codex === 'starting' ? 'Codex 啟動中' : 'Codex 未連線'}</span></span>{threadId ? <button className="icon-button rename-button" aria-label="重新命名對話" title="重新命名對話" onClick={() => { setRenameValue(selectedThread?.name || ''); setRenaming(true); }}><Icon name="edit" size={17} /></button> : null}<button className={`icon-button file-toggle ${filesOpen ? 'selected' : ''}`} aria-label="瀏覽專案檔案" title="瀏覽專案檔案" disabled={!project} onClick={() => setFilesOpen(!filesOpen)}><Icon name="folder" size={19} /></button></div></header>
+    <main className="workspace"><header className="workspace-header"><div className="workspace-breadcrumb"><button className="icon-button mobile-menu" aria-label="開啟專案與對話" onClick={() => setSidebarOpen(true)}><Icon name="menu" size={20} /></button><span className="breadcrumb-project">{project?.name || 'Codex 專案'}</span><span className="breadcrumb-divider">/</span><span className="breadcrumb-thread">{selectedThread?.name || selectedThread?.preview || '新的對話'}</span></div><div className="workspace-actions"><span className={`service-pill ${status.codex === 'ready' ? 'ready' : ''}`}><span className={`status-dot ${status.codex === 'ready' ? 'online' : ''}`} /><span>{status.codex === 'ready' ? 'Codex 已就緒' : status.codex === 'starting' ? 'Codex 啟動中' : 'Codex 未連線'}</span></span>{threadId ? <button className="icon-button rename-button" aria-label="重新命名對話" title="重新命名對話" onClick={() => { setRenameValue(selectedThread?.name || ''); setRenaming(true); }}><Icon name="edit" size={17} /></button> : null}<button className={`icon-button file-toggle ${filesOpen ? 'selected' : ''}`} aria-label="瀏覽專案檔案" title="瀏覽專案檔案" disabled={!project} onClick={() => setFilesOpen(!filesOpen)}><Icon name="folder" size={19} /></button></div></header>
       {connection === 'disconnected' ? <div className="connection-banner"><Icon name="refresh" size={14} />連線暫時中斷，電腦上的工作仍會繼續。正在重新連線…</div> : null}
       {status.codex === 'ready' && status.authenticated === false ? <div className="connection-banner warning"><Icon name="shield" size={14} />Codex 尚未登入。請在電腦執行 codex login，完成後重新啟動服務。</div> : null}
       {status.codex === 'offline' ? <div className="connection-banner warning"><Icon name="terminal" size={14} />Codex 尚未就緒。請在電腦上確認 CLI 安裝與登入狀態。</div> : null}
       <div className="workspace-body"><div className="conversation-column"><div className="conversation-scroll" ref={scrollRef} onScroll={() => { const element = scrollRef.current; if (element) followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 160; }}>
-        {!itemCount && !loading ? <div className="welcome"><div className="welcome-eyebrow"><span className="tiny-line" />YOUR DESK, IN YOUR POCKET</div><div className="welcome-symbol"><Icon name="code" size={36} /></div><h1>靈感在哪，<br /><span>工作就從哪開始。</span></h1><p>{project ? <>已連上 <strong>{project.name}</strong>。<br />交代下一步，讓電腦上的 Codex 接手。</> : <>新增可存取的專案路徑，<br />就能開始你的第一段對話。</>}</p><div className="welcome-tools"><span><Icon name="folder" size={15} />本機專案</span><span><Icon name="chat" size={15} />接續紀錄</span><span><Icon name="image" size={15} />圖片輸入</span></div><div className="welcome-hint"><Icon name="shield" size={15} /><span>工作在你的電腦執行，離開網頁也會繼續。</span></div></div> : <div className="messages">{historyCursor ? <button className="history-button" onClick={() => void olderHistory()}><Icon name="refresh" size={14} />載入更早的訊息</button> : null}{turns.map((turn) => <div className="turn" key={turn.id}>{turn.items.map((item) => <MessageItem item={item} key={item.id} />)}{turn.error ? <div className="turn-error"><Icon name="close" size={15} />{turn.error.message || '這項工作未完成。'}</div> : null}{turn.status === 'interrupted' ? <div className="turn-note">工作已中斷，可傳送新訊息接續。</div> : null}</div>)}{isWorking ? <div className="working-indicator"><span /><span /><span /><p>{currentRequests.length ? '等待你的回覆' : 'Codex 正在處理工作'}</p></div> : null}</div>}
+        {waitingForProjects ? <div className="welcome"><span className="spinner" /><p>{catalogLoadingText}</p></div> : !itemCount && !loading ? <div className="welcome"><div className="welcome-eyebrow"><span className="tiny-line" />YOUR DESK, IN YOUR POCKET</div><div className="welcome-symbol"><Icon name="code" size={36} /></div><h1>靈感在哪，<br /><span>工作就從哪開始。</span></h1><p>{project ? <>已連上 <strong>{project.name}</strong>。<br />交代下一步，讓電腦上的 Codex 接手。</> : <>請先在 Codex 桌面版加入專案，<br />再重新整理網頁以接續對話。</>}</p><div className="welcome-tools"><span><Icon name="folder" size={15} />本機專案</span><span><Icon name="chat" size={15} />接續紀錄</span><span><Icon name="image" size={15} />圖片輸入</span></div><div className="welcome-hint"><Icon name="shield" size={15} /><span>工作在你的電腦執行，離開網頁也會繼續。</span></div></div> : <div className="messages">{historyCursor ? <button className="history-button" onClick={() => void olderHistory()}><Icon name="refresh" size={14} />載入更早的訊息</button> : null}{turns.map((turn) => <div className="turn" key={turn.id}>{turn.items.map((item) => <MessageItem item={item} key={item.id} />)}{turn.error ? <div className="turn-error"><Icon name="close" size={15} />{turn.error.message || '這項工作未完成。'}</div> : null}{turn.status === 'interrupted' ? <div className="turn-note">工作已中斷，可傳送新訊息接續。</div> : null}</div>)}{isWorking ? <div className="working-indicator"><span /><span /><span /><p>{currentRequests.length ? '等待你的回覆' : 'Codex 正在處理工作'}</p></div> : null}</div>}
         {loading ? <div className="history-loading"><span className="spinner" />正在讀取對話…</div> : null}
         {currentRequests.length ? <div className="pending-requests">{currentRequests.map((request) => <PendingCard key={request.id} request={request} onRespond={respond} />)}</div> : null}<div ref={endRef} className="scroll-anchor" /></div>
         <div className="composer-area">{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="關閉錯誤訊息" onClick={() => setError('')}><Icon name="close" size={15} /></button></div> : null}<form className={`composer ${sending ? 'busy' : ''}`} onSubmit={(event) => { event.preventDefault(); void send(); }}>
           {attachments.length ? <div className="attachment-list">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}><img src={`/api/uploads/${encodeURIComponent(attachment.id)}`} alt={attachment.name} /><span>{attachment.name}</span><button type="button" className="icon-button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((previous) => previous.filter((entry) => entry.id !== attachment.id))}><Icon name="close" size={13} /></button></div>)}</div> : null}
           <textarea ref={composerRef} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !window.matchMedia('(pointer: coarse)').matches) { event.preventDefault(); void send(); } }} onPaste={(event) => { const imageFiles = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/')); if (imageFiles.length) { event.preventDefault(); void upload(imageFiles); } }} placeholder={isWorking ? '工作進行中，完成後可傳送下一則訊息…' : '交代下一步，或附上一張圖片…'} aria-label="傳送給 Codex 的訊息" rows={2} disabled={!projectId} />
-          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => setModel(event.target.value)} disabled={isWorking || sending}>{models.length ? models.map((entry) => <option value={entry.model} key={entry.id}>{entry.displayName || entry.model}</option>) : <option value="">預設模型</option>}</select><Icon name="chevron" size={11} /></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />工作區寫入 · 需要時核准</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
+          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => setModel(event.target.value)} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || loading || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />工作區寫入 · 需要時核准</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
       </div>{filesOpen && project ? <FileBrowser key={project.id} project={project} onClose={() => setFilesOpen(false)} /> : null}</div>
     </main>
     {renaming ? <div className="modal-backdrop" onClick={() => setRenaming(false)}><form className="rename-modal" onClick={(event) => event.stopPropagation()} onSubmit={(event) => void rename(event)}><h2>重新命名對話</h2><label htmlFor="thread-name">對話名稱</label><input id="thread-name" value={renameValue} onChange={(event) => setRenameValue(event.target.value)} maxLength={100} autoFocus required /><div><button type="button" className="button subtle" onClick={() => setRenaming(false)}>取消</button><button className="button accent" disabled={!renameValue.trim()}>儲存名稱</button></div></form></div> : null}

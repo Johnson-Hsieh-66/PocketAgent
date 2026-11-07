@@ -21,6 +21,8 @@
     "startup:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Remove",
     "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Start",
     "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Stop",
+    "firewall:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/firewall.ps1 -Action Install",
+    "firewall:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/firewall.ps1 -Action Remove",
     "secret:check": "node scripts/secret-check.mjs"
   },
   "dependencies": {

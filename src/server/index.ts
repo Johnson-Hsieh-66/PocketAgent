@@ -1,15 +1,15 @@
 import { mkdir, open, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { networkInterfaces } from 'node:os';
 import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:net';
-import { setTimeout as delay } from 'node:timers/promises';
 import { loadConfig } from './config.js';
 import { Store } from './store.js';
 import { Files } from './files.js';
 import { CodexBridge } from './codex.js';
 import { buildApp } from './http.js';
 import { resolveCodex } from './launcher.js';
+import { NetworkListeners } from './network.js';
+import { ProjectCatalog } from './projects.js';
 
 async function main() {
 const config = await loadConfig();
@@ -50,14 +50,15 @@ await writeFile(servicePath, JSON.stringify(service), { mode: 0o600 });
 let stopping = false;
 let bridge: CodexBridge | undefined;
 let store: Store | undefined;
-let app: Awaited<ReturnType<typeof buildApp>> | undefined;
+let listeners: NetworkListeners | undefined;
 function diagnostic(code: string) { process.stdout.write(`${JSON.stringify({ time: new Date().toISOString(), code })}\n`); }
 async function clean() {
   if (stopping) return;
   stopping = true;
-  if (app) for (const client of app.websocketServer.clients) client.terminate();
+  listeners?.pause();
+  listeners?.terminateClients();
   await bridge?.stop().catch(() => {});
-  await app?.close().catch(() => {});
+  await listeners?.close().catch(() => {});
   store?.close();
   for (const file of [servicePath, lockPath]) {
     try { if (JSON.parse(await readFile(file, 'utf8')).pid === process.pid) await unlink(file); } catch { /* already removed */ }
@@ -68,25 +69,15 @@ process.on('SIGINT', () => void clean().then(() => process.exit(0)));
 process.on('SIGTERM', () => void clean().then(() => process.exit(0)));
 process.on('uncaughtException', () => { diagnostic('UNCAUGHT_EXCEPTION'); void clean().then(() => process.exit(1)); });
 process.on('unhandledRejection', () => { diagnostic('UNHANDLED_REJECTION'); void clean().then(() => process.exit(1)); });
-function tailscaleAddress() {
-  for (const [name, values] of Object.entries(networkInterfaces())) for (const ip of values ?? []) {
-    const [a, b] = ip.address.split('.').map(Number);
-    if (/tailscale/i.test(name) && ip.family === 'IPv4' && a === 100 && b >= 64 && b <= 127 && !ip.internal) return ip.address;
-  }
-  return undefined;
-}
 try {
-  if (config.host === 'tailscale') {
-    diagnostic('WAITING_FOR_TAILSCALE');
-    while (!stopping) { const host = tailscaleAddress(); if (host) { config.host = host; break; } await delay(5000); }
-  }
   if (!stopping) {
     store = new Store(config.dataDir);
     bridge = new CodexBridge(resolveCodex(config.codexPath), store);
-    const files = new Files(config, store);
-    app = await buildApp({ config, store, bridge, files });
-    await app.listen({ host: config.host, port: config.port });
-    diagnostic('HTTP_READY');
+    const catalog = new ProjectCatalog(config, bridge);
+    const files = new Files(config, store, catalog);
+    const shared = { store, bridge, files };
+    listeners = new NetworkListeners(config, host => buildApp({ config: { ...config, host }, ...shared }), { diagnostic });
+    await listeners.start();
     await bridge.start().catch(() => diagnostic('CODEX_UNAVAILABLE'));
     const retry = setInterval(() => { if (!stopping && bridge?.status.codex === 'offline') void bridge.start().catch(() => diagnostic('CODEX_UNAVAILABLE')); }, 30_000);
     retry.unref();

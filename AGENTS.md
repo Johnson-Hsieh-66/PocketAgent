@@ -7,6 +7,7 @@ PocketAgent is a private, self-hosted mobile web interface to the local Codex CL
 - Use the installed CLI's generated protocol types. Never directly edit Codex credentials, session JSONL files or databases.
 - Browser disconnection must not stop a turn. Never automatically replay a prompt after a crash. Only one active turn per thread.
 - Default to workspace-write and interactive approvals. Never silently weaken account or workspace policies.
+- Private network mode binds separate loopback, physical RFC1918 LAN and Tailscale listeners sharing one Codex bridge and store. Keep Host/Origin validation specific to each listener; never broaden this into wildcard or public-address binding.
 
 ## Privacy boundary
 - All runtime state belongs outside the checkout under the user's LOCALAPPDATA/PocketAgent directory (or an explicitly configured external data directory).
@@ -15,6 +16,7 @@ PocketAgent is a private, self-hosted mobile web interface to the local Codex CL
 - Diagnostic logs contain only allowlisted metadata and error codes, never raw RPC messages, request bodies, command output or secrets.
 - Before every commit or push, inspect the full staged diff and run the repository secret check. Do not stage directories wholesale without inspecting the resulting file list.
 - No telemetry, external screenshot uploads or runtime data in CI artifacts. Keep Codex authentication on the server.
+- Network discovery and listener configuration are local runtime data. Never commit real adapter names, addresses, subnets, gateways, MAC addresses or other machine/network metadata; documentation uses LAN/Tailscale placeholders.
 
 ## Development
 - Run npm ci, npm run protocol:generate, npm run typecheck, npm test and npm run build as appropriate.

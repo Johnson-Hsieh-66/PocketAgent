@@ -36,7 +36,7 @@ const query = (request: FastifyRequest): ObjectValue => (request.query || {}) as
 const params = (request: FastifyRequest): ObjectValue => request.params as ObjectValue;
 
 export async function buildApp({ config, store, bridge, files }: AppOptions): Promise<FastifyInstance> {
-  if (config.host === 'tailscale') throw new Error('TAILSCALE_HOST_NOT_RESOLVED');
+  if (config.host === 'tailscale' || config.host === 'private') throw new Error('LISTENER_HOST_NOT_RESOLVED');
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024, requestTimeout: 30_000, trustProxy: false });
   await app.register(cookie);
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 0, parts: 1 } });
@@ -65,9 +65,11 @@ export async function buildApp({ config, store, bridge, files }: AppOptions): Pr
   app.get('/api/auth', async request => ({ authenticated: !!authenticate(request, store) }));
   app.post('/api/auth/pair', async (request, reply) => {
     const body = object(request.body);
-    const code = string(body.code, 8);
-    const deviceName = string(body.deviceName, 100).trim().replace(/[\x00-\x1f\x7f]/g, '');
-    if (!/^\d{8}$/.test(code) || !deviceName) throw new HttpError(400, 'INVALID_PAIRING_INPUT');
+    if (typeof body.code !== 'string' || body.code.length > 128) throw new HttpError(400, 'PAIRING_CODE_FORMAT_INVALID');
+    const code = body.code.normalize('NFKC').replace(/[\s-]/g, '');
+    if (!/^\d{8}$/.test(code)) throw new HttpError(400, 'PAIRING_CODE_FORMAT_INVALID');
+    if (body.deviceName !== undefined && (typeof body.deviceName !== 'string' || body.deviceName.length > 100)) throw new HttpError(400, 'DEVICE_NAME_INVALID');
+    const deviceName = (typeof body.deviceName === 'string' ? body.deviceName.trim().replace(/[\x00-\x1f\x7f]/g, '') : '') || '我的裝置';
     const paired = store.pair(code, deviceName);
     if (!paired) throw new HttpError(401, 'PAIRING_CODE_INVALID_OR_EXPIRED');
     reply.setCookie(COOKIE_NAME, paired.token, COOKIE_OPTIONS);
@@ -88,26 +90,37 @@ export async function buildApp({ config, store, bridge, files }: AppOptions): Pr
   async function checkedThread(threadId: string, projectId: string): Promise<any> {
     await files.project(projectId);
     const response = await bridge.request('thread/read', { threadId, includeTurns: false });
-    if (!response?.thread || typeof response.thread.cwd !== 'string') throw new HttpError(404, 'THREAD_NOT_FOUND');
+    if (!response?.thread || response.thread.id !== threadId || typeof response.thread.cwd !== 'string') throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const assigned = response.thread.projectId;
+    if (assigned !== projectId && (assigned || !(await files.threadIds(projectId)).includes(threadId))) throw new HttpError(403, 'THREAD_NOT_IN_PROJECT');
     await files.assertThread(projectId, response.thread.cwd);
     return response.thread;
   }
 
   app.get('/api/threads', async request => {
     const projectId = string(query(request).projectId);
-    const project = await files.project(projectId);
+    await files.project(projectId);
+    const legacyIds = await files.threadIds(projectId);
     const cursor = query(request).cursor;
-    const response = await bridge.request('thread/list', { cwd: project.path, sourceKinds: ['cli', 'vscode', 'appServer'], modelProviders: [], sortKey: 'updated_at', limit: 40, ...(cursor ? { cursor: string(cursor) } : {}) });
+    const response = await bridge.request('thread/list', { projectId, sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'], modelProviders: [], sortKey: 'updated_at', limit: 40, ...(cursor ? { cursor: string(cursor) } : {}) });
     const data: any[] = [];
+    const seen = new Set<string>();
     for (const thread of Array.isArray(response.data) ? response.data : []) {
-      try { await files.assertThread(projectId, thread.cwd); data.push(thread); } catch { /* Filter escaped or unavailable projects. */ }
+      if (typeof thread?.id !== 'string' || seen.has(thread.id) || (thread.projectId !== projectId && (thread.projectId || !legacyIds.includes(thread.id)))) continue;
+      try { await files.assertThread(projectId, thread.cwd); data.push(thread); seen.add(thread.id); } catch { /* Filter escaped or unavailable roots. */ }
     }
+    if (!cursor) for (const id of legacyIds) {
+      if (seen.has(id)) continue;
+      try { const thread = await checkedThread(id, projectId); data.push(thread); seen.add(id); } catch { /* A draft or unavailable legacy thread cannot hide the remaining history. */ }
+    }
+    data.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
     return { data, nextCursor: response.nextCursor || null };
   });
   app.post('/api/threads', async request => {
     const body = object(request.body);
     const project = await files.project(string(body.projectId));
-    return bridge.request('thread/start', { cwd: project.path, approvalPolicy: 'on-request', sandbox: 'workspace-write', ...(body.model ? { model: string(body.model) } : {}) });
+    if (!project.path) throw new HttpError(400, 'PROJECT_HAS_NO_LOCAL_ROOTS');
+    return bridge.request('thread/start', { projectId: project.id, cwd: project.path, approvalPolicy: 'on-request', sandbox: 'workspace-write', ...(body.model ? { model: string(body.model) } : {}) });
   });
   app.get('/api/threads/:id', async request => ({ thread: await checkedThread(string(params(request).id), string(query(request).projectId)) }));
   app.get('/api/threads/:id/turns', async request => {
