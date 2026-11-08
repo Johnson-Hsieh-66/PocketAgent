@@ -108,7 +108,7 @@ npm run pairing -- on
 
 若續接時出現「其他 Codex 客戶端正在使用此對話」（`THREAD_WRITER_CONFLICT`），代表其他客戶端仍持有該 session 的寫入權。請先讓原客戶端釋放該對話，再於網頁重試；即使沒有正在生成，原客戶端仍可能持有寫入權，停止生成或最小化視窗也不保證釋放。PocketAgent 不會強制解鎖或關閉其他客戶端。
 
-從網頁新建或續接 session 時，會套用 PocketAgent 的 `workspace-write` 與 `on-request` 權限預設，覆寫該 session 原本的個別偏好；帳號與組織的強制政策仍然優先。
+從網頁新建或續接 session 時，授權模式交由 Codex 依專案、對話與本機設定解析，PocketAgent 不再固定覆寫核准政策、審核方式或沙箱權限。輸入框下方會顯示 Codex 回傳的實際授權摘要，例如「唯讀 · 需要時核准」或「工作區寫入 · 自動審核」。專案的 `.codex/config.toml` 仍須符合 Codex 的信任條件才會生效；帳號與組織的強制政策仍然優先。桌面端尚未儲存的臨時選項是否保留，依 Codex 的續接行為而定。
 
 ### 目前的互動限制
 

@@ -61,7 +61,7 @@ lines.on('line', line => {
       setTimeout(() => respond(id, { value: params.value }), params.delay ?? 0);
       break;
     case 'fixture/stats':
-      respond(id, { starts, initializes, active: [...active.keys()], approvals: approvals.size });
+      respond(id, { starts, initializes, active: [...active.keys()], approvals: approvals.size, launchArgs: process.argv.slice(2) });
       break;
     case 'fixture/error':
       send({ id, error: { code: -32602, message: 'Synthetic upstream diagnostic that must stay private' } });

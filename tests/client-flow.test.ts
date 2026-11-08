@@ -84,7 +84,7 @@ describe('conversation UI recovery with synthetic Codex responses', () => {
       if (input === '/api/models') return json({ data: [{ id: 'synthetic-default-model', model: 'synthetic-default-model', displayName: 'Synthetic default', isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: ['low', 'medium', 'high'].map(reasoningEffort => ({ reasoningEffort, description: 'Synthetic effort' })) }, { id: 'synthetic-fast-model', model: 'synthetic-fast-model', displayName: 'Synthetic fast', defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Synthetic fast effort' }] }] });
       if (input === '/api/requests') return json({ requests: [] });
       if (input.startsWith('/api/threads?')) return json({ data: [...(created ? [created] : []), thread], nextCursor: null });
-      if (input === '/api/threads' && options?.method === 'POST') { created = { ...thread, id: 'synthetic-created-thread', name: '', preview: '' }; return json({ thread: created }); }
+      if (input === '/api/threads' && options?.method === 'POST') { created = { ...thread, id: 'synthetic-created-thread', name: '', preview: '' }; return json({ thread: created, sandbox: { type: 'readOnly' }, approvalPolicy: 'on-request', approvalsReviewer: 'user' }); }
       if (input.endsWith('/messages')) { const data = JSON.parse(String(options?.body)); return json({ turn: { id: 'synthetic-sent-turn', status: 'completed', items: [{ id: 'synthetic-user-message', type: 'userMessage', content: [{ type: 'text', text: data.text }] }] } }); }
       if (input.startsWith('/api/threads/synthetic-thread/turns?')) return historyHandler();
       if (input === '/api/threads/synthetic-thread/resume') return resumeHandler();
@@ -147,6 +147,7 @@ describe('conversation UI recovery with synthetic Codex responses', () => {
   });
   it('creates a new conversation and sends its first message with the chosen reasoning effort', async () => {
     await click(button('新增對話'));
+    expect(container.querySelector('.composer-caption')?.textContent).toContain('沿用 Codex 專案授權');
     await select('思考強度', 'high');
     await draft('Synthetic first message');
     await submit();
@@ -156,6 +157,15 @@ describe('conversation UI recovery with synthetic Codex responses', () => {
     expect(JSON.parse(String(sent[1]?.body))).toMatchObject({ projectId: project.id, text: 'Synthetic first message', effort: 'high' });
     expect(container.querySelector('.user-message .user-bubble')?.textContent).toBe('Synthetic first message');
     expect(container.querySelector('textarea')!.value).toBe('');
+    expect(container.querySelector('.composer-caption')?.textContent).toContain('唯讀 · 需要時核准');
+  });
+  it('shows effective resumed authorization and clears it when starting a different conversation', async () => {
+    resumeHandler = () => json({ thread, sandbox: { type: 'workspaceWrite' }, approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' });
+    await click(button(thread.name));
+    expect(container.querySelector('.composer-caption')?.textContent).toContain('工作區寫入 · 自動審核');
+    await click(button('新增對話'));
+    expect(container.querySelector('.composer-caption')?.textContent).toContain('沿用 Codex 專案授權');
+    expect(container.querySelector('.composer-caption')?.textContent).not.toContain('自動審核');
   });
   it('uses each model\'s supported efforts and preserves inherited effort when resuming', async () => {
     await select('思考強度', 'high');

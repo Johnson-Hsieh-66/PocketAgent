@@ -40,6 +40,10 @@ afterEach(async () => {
 });
 
 describe('Codex stdio bridge with a synthetic child', () => {
+  it('leaves approval and permission configuration to Codex when launching app-server', async () => {
+    const bridge = await start();
+    expect((await bridge.request('fixture/stats')).launchArgs).toEqual(['app-server', '--listen', 'stdio://']);
+  });
   it('remembers only verified project assignments from its own live thread starts and clears them on stop', async () => {
     const bridge = await start();
     await bridge.request('thread/start', { projectId: 'synthetic-project', cwd: '/synthetic/project' });

@@ -50,6 +50,22 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 const body = (value: unknown): string => JSON.stringify(value);
 const object = (value: unknown): Json => value && typeof value === 'object' && !Array.isArray(value) ? value as Json : {};
 const string = (value: unknown): string => typeof value === 'string' ? value : '';
+type ThreadSession = { thread: Thread; model?: string; reasoningEffort?: string | null } & Json;
+export function authorizationLabel(value: unknown): string | null {
+  const session = object(value);
+  const type = string(object(session.sandbox).type);
+  const profile = string(object(session.activePermissionProfile).id);
+  const scope = profile && !profile.startsWith(':') ? '自訂授權' : ({ readOnly: '唯讀', workspaceWrite: '工作區寫入', dangerFullAccess: '完整存取', externalSandbox: '外部沙箱' }[type] || '');
+  if (!scope) return null;
+  const policy = session.approvalPolicy;
+  const reviewer = session.approvalsReviewer;
+  let approval = '依 Codex 核准設定';
+  if (policy === 'never') approval = '不需核准';
+  else if (reviewer === 'auto_review' || reviewer === 'guardian_subagent') approval = '自動審核';
+  else if (typeof policy === 'string') approval = ({ 'on-request': '需要時核准', untrusted: '受限制核准', 'on-failure': '失敗時核准' }[policy] || approval);
+  else if (object(policy).granular) approval = '依授權規則核准';
+  return `${scope} · ${approval}`;
+}
 const errorMessages: Record<string, string> = {
   REQUEST_ALREADY_SUBMITTED: '這則訊息可能已送出。請先查看對話紀錄，確認後再編輯或建立新訊息。',
   THREAD_BUSY: '這個對話仍有工作正在執行。請等待完成，或先停止目前的工作。',
@@ -291,6 +307,7 @@ export function App() {
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
   const [inheritedEffort, setInheritedEffort] = useState('');
+  const [authorization, setAuthorization] = useState<string | null>(null);
   const [status, setStatus] = useState<ServiceStatus>({ codex: 'starting' });
   const [requests, setRequests] = useState<PendingRequest[]>([]);
   const [connection, setConnection] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
@@ -415,7 +432,7 @@ export function App() {
     if (projectViewRef.current !== projectId) {
       projectViewRef.current = projectId;
       viewEpochRef.current += 1;
-      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false); setContinuationReady(true); setInheritedEffort('');
+      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false); setContinuationReady(true); setInheritedEffort(''); setAuthorization(null);
     }
     setLoading(true);
     if (!projectId) { setLoading(false); return; }
@@ -527,12 +544,13 @@ export function App() {
     const epoch = ++viewEpochRef.current;
     const selectedProject = projectId;
     const isCurrentView = () => epoch === viewEpochRef.current && threadRef.current === entry.id && projectRef.current === selectedProject;
-    setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); setLoading(true); setContinuationReady(false); setModel(entry.model || ''); setEffort(''); setInheritedEffort(entry.reasoningEffort || ''); setError(''); setAttachments([]); followRef.current = true;
+    setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); setLoading(true); setContinuationReady(false); setModel(entry.model || ''); setEffort(''); setInheritedEffort(entry.reasoningEffort || ''); setAuthorization(null); setError(''); setAttachments([]); followRef.current = true;
     const history = refreshHistory(entry.id, selectedProject);
-    const resume = api<{ thread: Thread; model?: string; reasoningEffort?: string | null }>(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId: selectedProject }) }).then(resumed => {
+    const resume = api<ThreadSession>(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId: selectedProject }) }).then(resumed => {
       if (!isCurrentView()) return;
       setModel(typeof resumed.model === 'string' ? resumed.model : '');
       setInheritedEffort(resumed.reasoningEffort || entry.reasoningEffort || '');
+      setAuthorization(authorizationLabel(resumed));
       setContinuationReady(true);
     });
     const [historyResult, resumeResult] = await Promise.allSettled([history, resume]);
@@ -545,7 +563,7 @@ export function App() {
     setLoading(false);
     await refreshRequests();
   };
-  const newThread = () => { viewEpochRef.current += 1; const previous = effort || inheritedEffort; setEffort(selectedModel?.supportedReasoningEfforts?.some(option => option.reasoningEffort === previous) ? previous : selectedModel?.defaultReasoningEffort || ''); setInheritedEffort(''); setLoading(false); setContinuationReady(true); setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
+  const newThread = () => { viewEpochRef.current += 1; const previous = effort || inheritedEffort; setEffort(selectedModel?.supportedReasoningEfforts?.some(option => option.reasoningEffort === previous) ? previous : selectedModel?.defaultReasoningEffort || ''); setInheritedEffort(''); setAuthorization(null); setLoading(false); setContinuationReady(true); setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
   const send = async () => {
     if ((!text.trim() && !attachments.length) || sending || loading || !continuationReady || isWorking || !projectId || status.codex !== 'ready' || status.authenticated === false) return;
     const epoch = viewEpochRef.current;
@@ -557,8 +575,9 @@ export function App() {
     let id = threadId;
     try {
       if (!id) {
-        const data = await api<{ thread: Thread }>('/threads', { method: 'POST', body: body({ projectId: sendProject, model: model || undefined, effort: effort || undefined }) });
+        const data = await api<ThreadSession>('/threads', { method: 'POST', body: body({ projectId: sendProject, model: model || undefined, effort: effort || undefined }) });
         if (!isCurrentView()) return;
+        setAuthorization(authorizationLabel(data));
         id = data.thread.id; threadRef.current = id; setThreadId(id); setThreads((previous) => [data.thread, ...previous.filter((entry) => entry.id !== id)]);
       }
       const fingerprint = JSON.stringify({ id, text: sentText, attachmentIds: sentAttachments, model, effort });
@@ -648,7 +667,7 @@ export function App() {
         <div className="composer-area">{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="關閉錯誤訊息" onClick={() => setError('')}><Icon name="close" size={15} /></button></div> : null}<form className={`composer ${sending ? 'busy' : ''}`} onSubmit={(event) => { event.preventDefault(); void send(); }}>
           {attachments.length ? <div className="attachment-list">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}><img src={`/api/uploads/${encodeURIComponent(attachment.id)}`} alt={attachment.name} /><span>{attachment.name}</span><button type="button" className="icon-button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((previous) => previous.filter((entry) => entry.id !== attachment.id))}><Icon name="close" size={13} /></button></div>)}</div> : null}
           <textarea ref={composerRef} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !window.matchMedia('(pointer: coarse)').matches) { event.preventDefault(); void send(); } }} onPaste={(event) => { const imageFiles = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/')); if (imageFiles.length) { event.preventDefault(); void upload(imageFiles); } }} placeholder={isWorking ? '工作進行中，完成後可傳送下一則訊息…' : '交代下一步，或附上一張圖片…'} aria-label="傳送給 Codex 的訊息" rows={2} disabled={!projectId} />
-          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => { const next = models.find(entry => entry.model === event.target.value); setModel(event.target.value); setEffort(next?.defaultReasoningEffort || ""); setInheritedEffort(""); }} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div><div className="reasoning-picker"><span>思考</span><select aria-label="思考強度" value={effort} onChange={event => setEffort(event.target.value)} disabled={isWorking || sending || loading || !selectedModel?.supportedReasoningEfforts?.length}><ReasoningOptions model={selectedModel} inherited={inheritedEffort} /></select></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || loading || !continuationReady || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />工作區寫入 · 需要時核准</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
+          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => { const next = models.find(entry => entry.model === event.target.value); setModel(event.target.value); setEffort(next?.defaultReasoningEffort || ""); setInheritedEffort(""); }} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div><div className="reasoning-picker"><span>思考</span><select aria-label="思考強度" value={effort} onChange={event => setEffort(event.target.value)} disabled={isWorking || sending || loading || !selectedModel?.supportedReasoningEfforts?.length}><ReasoningOptions model={selectedModel} inherited={inheritedEffort} /></select></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || loading || !continuationReady || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />{authorization || (threadId ? '沿用 Codex 對話授權' : '沿用 Codex 專案授權')}</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
       </div>{filesOpen && project ? <FileBrowser key={project.id} project={project} onClose={() => setFilesOpen(false)} /> : null}</div>
     </main>
     {renaming ? <div className="modal-backdrop" onClick={() => setRenaming(false)}><form className="rename-modal" onClick={(event) => event.stopPropagation()} onSubmit={(event) => void rename(event)}><h2>重新命名對話</h2><label htmlFor="thread-name">對話名稱</label><input id="thread-name" value={renameValue} onChange={(event) => setRenameValue(event.target.value)} maxLength={100} autoFocus required /><div><button type="button" className="button subtle" onClick={() => setRenaming(false)}>取消</button><button className="button accent" disabled={!renameValue.trim()}>儲存名稱</button></div></form></div> : null}

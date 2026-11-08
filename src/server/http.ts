@@ -151,7 +151,7 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     if (!project.path) throw new HttpError(400, 'PROJECT_HAS_NO_LOCAL_ROOTS');
     const model = body.model === undefined ? undefined : string(body.model);
     const effort = await reasoningEffort(body.effort, model);
-    return bridge.request('thread/start', { projectId: project.id, cwd: project.path, approvalPolicy: 'on-request', sandbox: 'workspace-write', ...(model ? { model } : {}), ...(effort ? { config: { model_reasoning_effort: effort } } : {}) });
+    return bridge.request('thread/start', { projectId: project.id, cwd: project.path, ...(model ? { model } : {}), ...(effort ? { config: { model_reasoning_effort: effort } } : {}) });
   });
   app.get('/api/threads/:id', async request => ({ thread: await checkedThread(string(params(request).id), string(query(request).projectId)) }));
   app.get('/api/threads/:id/turns', async request => {
@@ -164,7 +164,7 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     const body = object(request.body);
     const threadId = string(params(request).id);
     const thread = await checkedThread(threadId, string(body.projectId));
-    return bridge.request('thread/resume', { threadId, cwd: thread.cwd, approvalPolicy: 'on-request', sandbox: 'workspace-write', excludeTurns: true });
+    return bridge.request('thread/resume', { threadId, cwd: thread.cwd, excludeTurns: true });
   });
   app.patch('/api/threads/:id', async request => {
     const body = object(request.body);

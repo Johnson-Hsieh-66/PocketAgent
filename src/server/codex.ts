@@ -55,7 +55,7 @@ export class CodexBridge extends EventEmitter {
     if (this.child) return;
     this.stopping = false;
     this.setStatus({ codex: 'starting' });
-    const child = spawn(this.executable.command, [...this.executable.args, 'app-server', '--listen', 'stdio://', '-c', 'approval_policy="on-request"', '-c', 'sandbox_mode="workspace-write"'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false });
+    const child = spawn(this.executable.command, [...this.executable.args, 'app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false });
     this.child = child;
     child.stdin.on('error', () => { /* Process lifecycle reports failures without raw diagnostics. */ });
     child.stderr.resume(); // Never forward possibly sensitive CLI diagnostics to logs.

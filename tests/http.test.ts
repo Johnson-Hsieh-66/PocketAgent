@@ -327,6 +327,18 @@ describe('private HTTP boundary and project access', () => {
     bridge.cwd = temp;
     expect((await app.inject({ url: `/api/threads/synthetic-new-thread?projectId=${projectId}`, headers: { ...headers, cookie } })).statusCode).toBe(403);
   });
+  it('inherits native project and session authorization without forwarding browser permission overrides', async () => {
+    const injected = { approvalPolicy: 'never', approvalsReviewer: 'user', sandbox: 'danger-full-access', permissions: 'synthetic-unrequested-profile', config: { sandbox_mode: 'danger-full-access' } };
+    const created = await app.inject({ method: 'POST', url: '/api/threads', headers: { ...headers, cookie }, payload: { projectId, model: 'synthetic-model', effort: 'high', ...injected } });
+    expect(created.statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/start', { projectId, cwd: bridge.cwd, model: 'synthetic-model', config: { model_reasoning_effort: 'high' } });
+    const resumed = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId, ...injected } });
+    expect(resumed.statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true });
+    const sent = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/messages', headers: { ...headers, cookie }, payload: { projectId, text: 'Synthetic message', requestId: 'synthetic-inherit-request', ...injected } });
+    expect(sent.statusCode).toBe(200);
+    expect(bridge.startTurn).toHaveBeenCalledWith('synthetic-thread', { input: [{ type: 'text', text: 'Synthetic message', text_elements: [] }] }, 'synthetic-inherit-request');
+  });
   it('rejects unsupported reasoning effort before creating a thread or dispatching a turn', async () => {
     for (const effort of ['unsupported', false, 5]) {
       expect((await app.inject({ method: 'POST', url: '/api/threads', headers: { ...headers, cookie }, payload: { projectId, effort } })).statusCode).toBe(400);

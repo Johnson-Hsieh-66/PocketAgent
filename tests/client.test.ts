@@ -1,13 +1,27 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { AccessFooter, api, applyThreadEvent, errorText, mergeHistory, mergeTurn, ModelOptions, normalizePairingCode, Pairing } from '../src/client/App';
+import { AccessFooter, api, applyThreadEvent, authorizationLabel, errorText, mergeHistory, mergeTurn, ModelOptions, normalizePairingCode, Pairing } from '../src/client/App';
 import type { AppEvent, Turn } from '../src/shared/types';
 
 const event = (method: string, params: Record<string, unknown>): AppEvent => ({ seq: 1, method, params: { threadId: 'fixture-thread', turnId: 'fixture-turn', ...params } });
 const turn = (text: string, status = 'inProgress'): Turn => ({ id: 'fixture-turn', status, items: [{ id: 'fixture-message', type: 'agentMessage', text }] });
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe('effective Codex authorization summary', () => {
+  it('describes actual access and reviewer settings instead of assuming workspace write', () => {
+    expect(authorizationLabel({ sandbox: { type: 'readOnly' }, approvalPolicy: 'on-request', approvalsReviewer: 'user' })).toBe('唯讀 · 需要時核准');
+    expect(authorizationLabel({ sandbox: { type: 'workspaceWrite' }, approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' })).toBe('工作區寫入 · 自動審核');
+    expect(authorizationLabel({ sandbox: { type: 'dangerFullAccess' }, approvalPolicy: 'never', approvalsReviewer: 'auto_review' })).toBe('完整存取 · 不需核准');
+    expect(authorizationLabel({ sandbox: { type: 'workspaceWrite' }, activePermissionProfile: { id: ':workspace' }, approvalPolicy: { granular: {} } })).toBe('工作區寫入 · 依授權規則核准');
+  });
+  it('uses fixed labels for custom profiles and falls back when effective settings are unavailable', () => {
+    expect(authorizationLabel({ sandbox: { type: 'workspaceWrite' }, activePermissionProfile: { id: 'synthetic-private-profile' }, approvalPolicy: 'on-request' })).toBe('自訂授權 · 需要時核准');
+    expect(authorizationLabel({ sandbox: { type: 'synthetic-unknown' }, approvalPolicy: 'on-request' })).toBeNull();
+    expect(authorizationLabel(null)).toBeNull();
+  });
+});
 
 describe('recoverable API errors', () => {
   it('retains the submission code for recovery while rendering a Chinese warning against accidental replay', async () => {
