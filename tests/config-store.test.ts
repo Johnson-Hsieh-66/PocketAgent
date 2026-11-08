@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -21,6 +21,18 @@ describe('external runtime configuration and pairing limits', () => {
     expect(saved.host).toBe('private');
     expect(saved).not.toHaveProperty('projectRoots');
     expect(() => loadConfig({ POCKETAGENT_DATA_DIR: path.join(config.checkoutDir, 'synthetic-runtime') })).toThrow('RUNTIME_DIRECTORY_INSIDE_CHECKOUT');
+  });
+  it('keeps the original source privacy boundary while serving a versioned application', async () => {
+    const source = path.join(temp, 'synthetic-source');
+    await mkdir(source);
+    await writeFile(path.join(source, 'package.json'), JSON.stringify({ name: 'pocketagent' }));
+    const original = loadConfig({ POCKETAGENT_DATA_DIR: path.join(temp, 'runtime') });
+    const release = loadConfig({ POCKETAGENT_DATA_DIR: path.join(temp, 'runtime'), POCKETAGENT_CHECKOUT_DIR: source, POCKETAGENT_RELEASE_ID: 'synthetic-release' });
+    expect(release.checkoutDir.toLowerCase()).toBe(source.toLowerCase());
+    expect(release.staticDir).toBe(original.staticDir);
+    expect(release.releaseId).toBe('synthetic-release');
+    expect(() => loadConfig({ POCKETAGENT_DATA_DIR: path.join(source, 'private-runtime'), POCKETAGENT_CHECKOUT_DIR: source })).toThrow('RUNTIME_DIRECTORY_INSIDE_CHECKOUT');
+    expect(() => loadConfig({ POCKETAGENT_DATA_DIR: path.join(temp, 'runtime'), POCKETAGENT_RELEASE_ID: '../escape' })).toThrow('INVALID_RELEASE_ID');
   });
   it('classifies canonical private IPv4 ranges and rejects public or malformed hosts', async () => {
     const loopback = [[127, 0, 0, 0], [127, 255, 255, 255]].map(octets => octets.join('.'));

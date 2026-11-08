@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { AccessSettings } from './AccessSettings';
 import type { AppEvent, Attachment, AuthState, FileEntry, Model, PendingRequest, Project, ServiceStatus, Thread, ThreadItem, Turn } from '../shared/types';
 
 type Json = Record<string, unknown>;
@@ -39,8 +40,12 @@ function Mark({ small = false }: { small?: boolean }) {
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
-  const response = await fetch(`/api${path}`, { ...options, headers, credentials: 'same-origin' });
+  const signal = options.signal ?? AbortSignal.timeout(15_000);
+  let response: Response;
+  try { response = await fetch(`/api${path}`, { ...options, signal, headers, credentials: 'same-origin' }); }
+  catch (reason) { if (signal.aborted) throw new Error(path.endsWith('/messages') ? 'MESSAGE_OUTCOME_UNKNOWN' : 'REQUEST_TIMEOUT'); throw reason; }
   const data = await response.json().catch(() => ({})) as Json;
+  if (signal.aborted) throw new Error(path.endsWith('/messages') ? 'MESSAGE_OUTCOME_UNKNOWN' : 'REQUEST_TIMEOUT');
   if (!response.ok) {
     if (response.status === 401 && path !== '/auth/pair' && typeof window !== 'undefined') window.dispatchEvent(new Event('pocketagent:reauth'));
     throw new Error(typeof data.message === 'string' ? data.message : typeof data.error === 'string' ? data.error : `連線失敗（${response.status}）`);
@@ -50,10 +55,23 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 const body = (value: unknown): string => JSON.stringify(value);
 const object = (value: unknown): Json => value && typeof value === 'object' && !Array.isArray(value) ? value as Json : {};
 const string = (value: unknown): string => typeof value === 'string' ? value : '';
+const HISTORY_PAGE_SIZE = 6;
+type ViewSelection = { projectId: string; threadId: string };
+function readSelection(): ViewSelection {
+  const route = new URLSearchParams(typeof location === 'undefined' ? '' : location.hash.slice(1));
+  return { projectId: route.get('project') || '', threadId: route.get('thread') || '' };
+}
+function rememberSelection(projectId: string, threadId = '') {
+  const route = new URLSearchParams();
+  if (projectId) route.set('project', projectId);
+  if (threadId) route.set('thread', threadId);
+  // Only navigation identifiers go in the browser URL; conversation content stays on the server.
+  window.history.replaceState(null, '', `${location.pathname}${location.search}${route.size ? `#${route}` : ''}`);
+}
 type ThreadSession = { thread: Thread; model?: string; reasoningEffort?: string | null } & Json;
 export function authorizationLabel(value: unknown): string | null {
   const session = object(value);
-  const type = string(object(session.sandbox).type);
+  const type = string(object(session.sandbox ?? session.sandboxPolicy).type);
   const profile = string(object(session.activePermissionProfile).id);
   const scope = profile && !profile.startsWith(':') ? '自訂授權' : ({ readOnly: '唯讀', workspaceWrite: '工作區寫入', dangerFullAccess: '完整存取', externalSandbox: '外部沙箱' }[type] || '');
   if (!scope) return null;
@@ -70,7 +88,12 @@ const errorMessages: Record<string, string> = {
   REQUEST_ALREADY_SUBMITTED: '這則訊息可能已送出。請先查看對話紀錄，確認後再編輯或建立新訊息。',
   THREAD_BUSY: '這個對話仍有工作正在執行。請等待完成，或先停止目前的工作。',
   CODEX_OFFLINE: 'Codex 目前未連線。請在電腦上確認 CLI 狀態，再重新連線。',
+  WORKER_OFFLINE: '執行服務暫時未連線，網頁會重新連線；不會自動重送訊息。',
+  WORKER_DISCONNECTED: '與執行服務的連線已中斷，正在重新連線；請先確認原工作狀態。',
+  WORKER_UNAVAILABLE: '執行服務尚未就緒，請稍後重新連線。',
+  WORKER_MAINTENANCE: '執行服務正在更新，完成後可接續對話。',
   THREAD_RESUME_FAILED: '已載入可讀取的對話紀錄，但目前無法接續。請重新選取這個對話再試一次。',
+  DESKTOP_REVIEWER_NOT_APPLIED: 'Codex 尚未套用桌面 App 選擇的審核模式。請確認本機政策允許該模式，再重新選取對話。',
   THREAD_WRITER_CONFLICT: '這個對話目前由其他 Codex 客戶端開啟，暫時只能檢視；原客戶端釋放後，再重新選取以接續。',
   INVALID_ATTACHMENTS: '每則訊息最多附加 8 張圖片。',
   UNSUPPORTED_REASONING_EFFORT: '目前模型不支援這個思考強度，請重新選擇。',
@@ -83,6 +106,10 @@ const errorMessages: Record<string, string> = {
   HOST_NOT_ALLOWED: '這個服務位址未獲允許。請使用已設定的區網或 Tailscale IP 開啟網頁。',
   ORIGIN_REQUIRED: '請直接使用 PocketAgent 的服務位址開啟網頁，再重新操作。',
   ORIGIN_NOT_ALLOWED: '這個網頁來源未獲允許。請直接使用 PocketAgent 的服務位址。',
+  RECOVERY_UNAVAILABLE: '目前無法執行緊急恢復，請確認電腦上的服務狀態後再試一次。',
+  CODEX_RECOVERY_FAILED: '緊急恢復未完成，請確認電腦上的 Codex 狀態後再試一次。',
+  REQUEST_TIMEOUT: '連線逾時。草稿已保留，可重新連線後再試一次。',
+  MESSAGE_OUTCOME_UNKNOWN: '送出結果尚未確認，訊息可能已送達。請先重新連線查看對話；系統不會自動重送。',
 };
 export const errorText = (value: unknown): string => value instanceof Error ? errorMessages[value.message] || value.message : '操作未完成，請再試一次。';
 
@@ -116,13 +143,21 @@ export function ReasoningOptions({ model, inherited }: { model?: Model; inherite
 }
 
 const terminalStatus = (status: string) => ['completed', 'failed', 'interrupted'].includes(status);
+const activeStatus = (status: string) => ['inProgress', 'running', 'active'].includes(status);
+type OutputField = 'text' | 'aggregatedOutput';
+type StreamState = { consumed: Partial<Record<OutputField, string>>; completed: boolean };
+const streams = new WeakMap<ThreadItem, StreamState>();
 
-function mergeItem(existing: ThreadItem, incoming: ThreadItem): ThreadItem {
+function mergeItem(existing: ThreadItem, incoming: ThreadItem, authoritative = false): ThreadItem {
   const merged = { ...existing, ...incoming };
-  for (const field of ['text', 'aggregatedOutput']) {
-    if (string(existing[field]).length > string(incoming[field]).length) merged[field] = existing[field];
+  const oldStream = streams.get(existing);
+  const newStream = streams.get(incoming);
+  for (const field of ['text', 'aggregatedOutput'] as const) {
+    if ((authoritative || newStream?.completed) && typeof incoming[field] === 'string') continue;
+    if ((oldStream?.completed && !newStream?.completed) || string(existing[field]).length > string(incoming[field]).length) merged[field] = existing[field];
   }
   if (terminalStatus(string(existing.status)) && !terminalStatus(string(incoming.status))) merged.status = existing.status;
+  if (oldStream || newStream || authoritative) streams.set(merged, { consumed: { ...oldStream?.consumed, ...newStream?.consumed }, completed: authoritative || !!oldStream?.completed || !!newStream?.completed });
   return merged;
 }
 
@@ -132,7 +167,7 @@ export function mergeTurn(turns: Turn[], incoming: Turn): Turn[] {
   const items = [...existing.items];
   for (const item of incoming.items ?? []) {
     const index = items.findIndex((entry) => entry.id === item.id);
-    if (index < 0) items.push(item); else items[index] = mergeItem(items[index], item);
+    if (index < 0) items.push(item); else items[index] = mergeItem(items[index], item, terminalStatus(incoming.status));
   }
   return turns.map((turn) => turn.id === incoming.id ? { ...turn, ...incoming, status: terminalStatus(turn.status) && !terminalStatus(incoming.status) ? turn.status : incoming.status, items } : turn);
 }
@@ -155,7 +190,8 @@ export function applyThreadEvent(turns: Turn[], event: AppEvent): Turn[] {
   if (event.method === 'item/started' || event.method === 'item/completed') {
     const item = object(params.item) as ThreadItem;
     if (!item.id) return next;
-    return next.map((turn) => turn.id !== turnId ? turn : { ...turn, items: turn.items.some((entry) => entry.id === item.id) ? turn.items.map((entry) => entry.id === item.id ? { ...entry, ...item } : entry) : [...turn.items, item] });
+    if (event.method === 'item/completed') streams.set(item, { consumed: {}, completed: true });
+    return next.map((turn) => turn.id !== turnId ? turn : { ...turn, items: turn.items.some((entry) => entry.id === item.id) ? turn.items.map((entry) => entry.id === item.id ? mergeItem(entry, item, event.method === 'item/completed') : entry) : [...turn.items, item] });
   }
   const itemId = string(params.itemId);
   const delta = string(params.delta);
@@ -164,9 +200,19 @@ export function applyThreadEvent(turns: Turn[], event: AppEvent): Turn[] {
     const field = event.method.includes('commandExecution') ? 'aggregatedOutput' : 'text';
     const type = event.method.includes('commandExecution') ? 'commandExecution' : event.method.includes('/plan/') ? 'plan' : 'agentMessage';
     next = next.map((turn) => {
-      if (turn.id !== turnId) return turn;
+      if (turn.id !== turnId || terminalStatus(turn.status)) return turn;
       const existing = turn.items.find((item) => item.id === itemId);
-      return { ...turn, items: existing ? turn.items.map((item) => item.id === itemId ? { ...item, [field]: string(item[field]) + delta } : item) : [...turn.items, { id: itemId, type, [field]: delta }] };
+      const streamed = existing || { id: itemId, type };
+      const stream = streams.get(streamed);
+      if (stream?.completed) return turn;
+      const visible = string(streamed[field]);
+      const consumed = (stream?.consumed[field] ?? visible) + delta;
+      // A snapshot may already display deltas still queued on the socket. Track
+      // consumed stream text independently until it catches up to that snapshot.
+      const text = visible.startsWith(consumed) ? visible : consumed.startsWith(visible) ? consumed : visible + delta;
+      const updated = { ...streamed, [field]: text };
+      streams.set(updated, { consumed: { ...stream?.consumed, [field]: visible.startsWith(consumed) || consumed.startsWith(visible) ? consumed : text }, completed: false });
+      return { ...turn, items: existing ? turn.items.map(item => item.id === itemId ? updated : item) : [...turn.items, updated] };
     });
   }
   return next;
@@ -179,7 +225,7 @@ function Markdown({ text }: { text: string }) {
   }}>{text}</ReactMarkdown></div>;
 }
 
-function MessageItem({ item }: { item: ThreadItem }) {
+const MessageItem = memo(function MessageItem({ item }: { item: ThreadItem }) {
   if (item.type === 'userMessage') {
     const content = Array.isArray(item.content) ? item.content : [];
     return <div className="message user-message"><div className="message-heading"><span className="avatar user-avatar">你</span><span>你</span></div><div className="user-bubble">{content.map((part, index) => {
@@ -201,7 +247,7 @@ function MessageItem({ item }: { item: ThreadItem }) {
   }
   if (item.type === 'mcpToolCall' || item.type === 'webSearch') return <details className="activity-card"><summary><Icon name="link" size={16} /><span className="activity-title">{string(item.tool) || (item.type === 'webSearch' ? '網頁搜尋' : '使用工具')}</span><Icon name="chevron" size={14} /></summary><div className="activity-empty">{string(item.server) || 'Codex 工具操作'}</div></details>;
   return null;
-}
+});
 
 function PendingCard({ request, onRespond }: { request: PendingRequest; onRespond: (id: string | number, result: unknown) => Promise<void> }) {
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -253,17 +299,15 @@ export function Pairing({ onPaired }: { onPaired: () => void | Promise<void> }) 
   return <div className="pairing-screen"><div className="pairing-decoration" /><header className="pairing-brand"><Mark /><strong>PocketAgent<span>你的工作，隨身接續。</span></strong></header><main className="pairing-card"><div className="eyebrow"><span className="status-dot online" /> PRIVATE WORKSPACE</div><h1>連上你的<br /><em>工作空間。</em></h1><p className="pairing-description">與這台電腦配對，從手機接續 Codex 的每一項工作。</p><form onSubmit={(event) => void submit(event)}><label htmlFor="pair-code">一次性配對碼</label><input id="pair-code" className="code-input" autoComplete="one-time-code" inputMode="numeric" placeholder="輸入配對碼" value={code} onChange={(event) => setCode(normalizePairingCode(event.target.value))} onPaste={(event) => { event.preventDefault(); setCode(normalizePairingCode(event.clipboardData.getData('text'))); }} required autoFocus maxLength={8} minLength={8} pattern="[0-9]{8}" /><label htmlFor="device-name">裝置名稱</label><input id="device-name" value={deviceName} onChange={(event) => setDeviceName(event.target.value)} maxLength={64} required />{error ? <p className="inline-error" role="alert">{error}</p> : null}<button className="button accent pair-button" disabled={busy || !/^[0-9]{8}$/.test(code) || !deviceName.trim()}>{busy ? '正在配對…' : '配對這個裝置'}<Icon name="arrow" size={18} /></button></form><div className="pair-help"><Icon name="terminal" size={16} /><p>在電腦的 PocketAgent 目錄執行 <code>npm run pair</code> 取得配對碼。</p></div><footer><Icon name="shield" size={14} />配對碼 10 分鐘內有效 · 裝置驗證保留 30 天</footer></main><div className="pairing-bottom">LOCAL COMPUTE. ANYWHERE YOU ARE.</div></div>;
 }
 
-export function AccessFooter({ required, paired, connection, busy, onPairingChange, onLogout }: {
+export function AccessFooter({ required, paired, connection, busy, onPairingChange, onLogout, onReconnect, onRecover, recovering }: {
   required: boolean; paired: boolean; connection: 'connecting' | 'connected' | 'disconnected'; busy: boolean;
   onPairingChange: (required: boolean) => void; onLogout: () => void;
+  onReconnect: () => void; onRecover: () => void | Promise<void>; recovering: boolean;
 }) {
   const mode = required ? paired ? '裝置已配對' : '等待裝置配對' : '免配對';
   return <footer className="sidebar-footer">
     <div className="private-connection"><span className="connection-glyph"><Icon name="shield" size={17} /></span><div><strong>私人工作空間</strong><span>{mode} · {connection === 'connected' ? '私人連線' : '恢復連線中'}</span></div><span className={`status-dot ${connection === 'connected' ? 'online' : ''}`} /></div>
-    <div className="pairing-setting">
-      <label className="pairing-setting-control"><span>要求裝置配對</span><span className="pairing-setting-value">{busy ? '儲存中…' : required ? '開啟' : '關閉'}</span><input className="visually-hidden" type="checkbox" role="switch" aria-label="要求裝置配對" checked={required} disabled={busy} onChange={event => onPairingChange(event.target.checked)} /><span className={`pairing-switch ${required ? 'enabled' : ''}`} aria-hidden="true"><span /></span></label>
-      <p>關閉時，能連到服務的裝置可直接使用。</p>
-    </div>
+    <AccessSettings required={required} busy={busy} onChange={onPairingChange} onReconnect={onReconnect} onRecover={onRecover} recovering={recovering} />
     {paired ? <button className="logout-button" onClick={onLogout}><Icon name="logout" size={15} />移除此裝置配對</button> : null}
   </footer>;
 }
@@ -290,6 +334,7 @@ function FileBrowser({ project, onClose }: { project: Project; onClose: () => vo
 }
 
 export function App() {
+  const initialSelectionRef = useRef<ViewSelection | null>(readSelection());
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [pairingRequired, setPairingRequired] = useState(true);
   const [paired, setPaired] = useState(false);
@@ -297,12 +342,13 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
-  const [projectId, setProjectId] = useState('');
+  const [projectId, setProjectId] = useState(initialSelectionRef.current?.projectId || '');
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadCursor, setThreadCursor] = useState<string | null>(null);
   const [threadId, setThreadId] = useState('');
   const [turns, setTurns] = useState<Turn[]>([]);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [olderLoading, setOlderLoading] = useState(false);
   const [models, setModels] = useState<Model[]>([]);
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
@@ -317,6 +363,8 @@ export function App() {
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(false);
   const [continuationReady, setContinuationReady] = useState(true);
+  const [recovering, setRecovering] = useState(false);
+  const [recoveryReady, setRecoveryReady] = useState(0);
   const [error, setError] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
@@ -331,6 +379,28 @@ export function App() {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
+  const olderInFlightRef = useRef(false);
+  const historyCursorRef = useRef<string | null>(null);
+  const historyLoadedRef = useRef(false);
+  const historyPagedRef = useRef(false);
+  const prependAnchorRef = useRef<{ epoch: number; offset: number } | null>(null);
+  const workingRef = useRef(false);
+  const historyRequestRef = useRef(0);
+  const turnsRef = useRef(turns);
+  const threadRevisionRef = useRef(0);
+  const projectEpochRef = useRef(0);
+  const threadsRequestRef = useRef(0);
+  const threadPagesLoadedRef = useRef(false);
+  const threadCursorRef = useRef<string | null>(null);
+  const threadPageInFlightRef = useRef<string | null>(null);
+  const recoveryRef = useRef<{ id: number; accepted: boolean; sawUnavailable: boolean; generation: string | null } | null>(null);
+  const recoveryIdRef = useRef(0);
+  const statusRef = useRef(status);
+  const generationRef = useRef<string | null>(null);
+  const continuationReadyRef = useRef(continuationReady);
+  const resumeNeededRef = useRef(false);
+  const resumeFailureRef = useRef<'transient' | 'writer' | null>(null);
+  const resumeFlightRef = useRef<{ key: string; promise: Promise<ThreadSession | undefined> } | null>(null);
   const submissionRef = useRef<{ fingerprint: string; requestId: string } | null>(null);
   const viewEpochRef = useRef(0);
   const projectsRequestRef = useRef(0);
@@ -342,6 +412,9 @@ export function App() {
   const selectedThread = threads.find((entry) => entry.id === threadId);
   const selectedModel = models.find(entry => entry.model === model);
   const isWorking = turns.some((turn) => ['inProgress', 'running', 'active'].includes(turn.status)) || selectedThread?.status?.type === 'active';
+  workingRef.current = isWorking;
+  turnsRef.current = turns;
+  continuationReadyRef.current = continuationReady;
   const currentRequests = requests.filter((request) => string(request.params.threadId) === threadId || (!request.params.threadId && !!threadId));
   const itemCount = turns.reduce((count, turn) => count + turn.items.length, 0);
   const waitingForProjects = !project && (projectsLoading || !projectsLoaded);
@@ -349,8 +422,38 @@ export function App() {
 
   useEffect(() => { threadRef.current = threadId; }, [threadId]);
   useEffect(() => { projectRef.current = projectId; }, [projectId]);
-  useEffect(() => { if (followRef.current) endRef.current?.scrollIntoView({ behavior: sending ? 'smooth' : 'instant', block: 'end' }); }, [turns, requests, sending]);
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const anchor = prependAnchorRef.current;
+    if (anchor) {
+      prependAnchorRef.current = null;
+      if (anchor.epoch === viewEpochRef.current) element.scrollTop = element.scrollHeight - anchor.offset;
+    } else if (followRef.current) element.scrollTop = element.scrollHeight;
+  }, [turns, requests, sending]);
   useEffect(() => { const element = composerRef.current; if (element) { element.style.height = 'auto'; element.style.height = `${Math.min(element.scrollHeight, 180)}px`; } }, [text]);
+
+  const observeStatus = useCallback((next: ServiceStatus, trackRecovery = false, requestedGeneration?: string | null) => {
+    const generation = typeof next.generation === 'string' ? next.generation : null;
+    if (requestedGeneration !== undefined && requestedGeneration !== generationRef.current && generation !== generationRef.current) return;
+    if (generation) {
+      const changed = generationRef.current !== null && generationRef.current !== generation;
+      generationRef.current = generation;
+      if (changed) sequenceRef.current = 0;
+      if (changed && threadRef.current) {
+        resumeFailureRef.current = null;
+        resumeNeededRef.current = true;
+        continuationReadyRef.current = false;
+        setContinuationReady(false);
+      }
+    }
+    statusRef.current = next;
+    setStatus(next);
+    const recovery = recoveryRef.current;
+    if (!recovery || !trackRecovery) return;
+    if (next.codex !== 'ready') recovery.sawUnavailable = true;
+    else if (recovery.accepted && (recovery.sawUnavailable || (recovery.generation && generation && recovery.generation !== generation))) setRecoveryReady(recovery.id);
+  }, []);
 
   const applyAccess = useCallback((access: AuthState) => {
     accessStateRef.current = access;
@@ -382,16 +485,81 @@ export function App() {
     finally { if (request === projectsRequestRef.current) setProjectsLoading(false); }
   }, []);
   const refreshHistory = useCallback(async (id: string, pid: string) => {
-    const data = await api<{ data: Turn[]; nextCursor?: string | null }>(`/threads/${encodeURIComponent(id)}/turns?projectId=${encodeURIComponent(pid)}`);
-    if (threadRef.current === id && projectRef.current === pid) { setTurns((live) => mergeHistory([...data.data].reverse(), live)); setHistoryCursor(data.nextCursor || null); }
+    const epoch = viewEpochRef.current;
+    const request = ++historyRequestRef.current;
+    const revision = threadRevisionRef.current;
+    const activeAtStart = new Set(turnsRef.current.filter(turn => activeStatus(turn.status)).map(turn => turn.id));
+    const data = await api<{ data: Turn[]; nextCursor?: string | null }>(`/threads/${encodeURIComponent(id)}/turns?projectId=${encodeURIComponent(pid)}&limit=${HISTORY_PAGE_SIZE}`);
+    if (threadRef.current !== id || projectRef.current !== pid || epoch !== viewEpochRef.current || request !== historyRequestRef.current) return;
+    const pageIds = new Set(data.data.map(turn => turn.id));
+    const hasActive = activeAtStart.size > 0 || data.data.some(turn => activeStatus(turn.status));
+    const canonical = hasActive ? await api<{ thread: Thread }>(`/threads/${encodeURIComponent(id)}?projectId=${encodeURIComponent(pid)}`).catch(() => undefined) : undefined;
+    if (threadRef.current !== id || projectRef.current !== pid || epoch !== viewEpochRef.current || request !== historyRequestRef.current) return;
+    const confirmedIdle = canonical?.thread.status?.type === 'idle' && revision === threadRevisionRef.current;
+    const firstPage = !historyLoadedRef.current;
+    historyLoadedRef.current = true;
+    setTurns(live => {
+      const merged = firstPage ? mergeHistory([...data.data].reverse(), live) : mergeHistory(live, [...data.data].reverse());
+      return confirmedIdle ? merged.map(turn => (activeAtStart.has(turn.id) || pageIds.has(turn.id)) && activeStatus(turn.status) ? { ...turn, status: 'unknown' } : turn) : merged;
+    });
+    // A live refresh must not rewind pagination after the reader has loaded older pages.
+    if (!historyPagedRef.current) {
+      historyCursorRef.current = data.nextCursor || null;
+      setHistoryCursor(data.nextCursor || null);
+    }
+    if (data.data.length || confirmedIdle) setThreads(previous => previous.map(entry => entry.id === id ? { ...entry, status: { type: !confirmedIdle && data.data.some(turn => activeStatus(turn.status)) ? 'active' : 'idle' } } : entry));
   }, []);
 
   const loadThreads = useCallback(async (pid: string, cursor?: string) => {
-    const data = await api<{ data: Thread[]; nextCursor?: string | null }>(`/threads?projectId=${encodeURIComponent(pid)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
-    if (projectRef.current !== pid) return;
-    setThreads((previous) => cursor ? [...previous, ...data.data.filter((entry) => !previous.some((old) => old.id === entry.id))] : data.data);
-    setThreadCursor(data.nextCursor || null);
+    if (cursor && (threadPageInFlightRef.current || cursor !== threadCursorRef.current)) return;
+    const epoch = projectEpochRef.current;
+    const request = cursor ? 0 : ++threadsRequestRef.current;
+    if (cursor) threadPageInFlightRef.current = cursor;
+    try {
+      const data = await api<{ data: Thread[]; nextCursor?: string | null }>(`/threads?projectId=${encodeURIComponent(pid)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+      if (projectRef.current !== pid || epoch !== projectEpochRef.current || (!cursor && request !== threadsRequestRef.current)) return;
+      if (cursor) threadPagesLoadedRef.current = true;
+      setThreads(previous => {
+        if (cursor) return [...previous, ...data.data.filter(entry => !previous.some(old => old.id === entry.id))];
+        const retained = previous.filter(entry => !data.data.some(incoming => incoming.id === entry.id) && (threadPagesLoadedRef.current || entry.id === threadRef.current));
+        return [...data.data, ...retained];
+      });
+      if (cursor || !threadPagesLoadedRef.current) { threadCursorRef.current = data.nextCursor || null; setThreadCursor(threadCursorRef.current); }
+    } finally { if (cursor && epoch === projectEpochRef.current && threadPageInFlightRef.current === cursor) threadPageInFlightRef.current = null; }
   }, []);
+
+  const resumeSelected = useCallback((): Promise<ThreadSession | undefined> => {
+    const id = threadRef.current; const pid = projectRef.current;
+    if (!id || !pid || resumeFailureRef.current === 'writer') return Promise.resolve(undefined);
+    const epoch = viewEpochRef.current;
+    const generation = generationRef.current;
+    const key = JSON.stringify([epoch, pid, id, generation]);
+    if (resumeFlightRef.current?.key === key) return resumeFlightRef.current.promise;
+    const current = () => epoch === viewEpochRef.current && id === threadRef.current && pid === projectRef.current && (!generation || generation === generationRef.current);
+    continuationReadyRef.current = false; setContinuationReady(false);
+    const promise = api<ThreadSession>(`/threads/${encodeURIComponent(id)}/resume`, { method: 'POST', body: body({ projectId: pid }) }).then(resumed => {
+      if (!current()) return undefined;
+      resumeFailureRef.current = null; resumeNeededRef.current = false;
+      continuationReadyRef.current = true; setContinuationReady(true);
+      setAuthorization(authorizationLabel(resumed));
+      if (typeof resumed.reasoningEffort === 'string') setInheritedEffort(resumed.reasoningEffort);
+      setError(previous => [errorText(new Error('THREAD_RESUME_FAILED')), errorText(new Error('CODEX_OFFLINE')), errorText(new Error('REQUEST_TIMEOUT'))].includes(previous) ? '' : previous);
+      return resumed;
+    }).catch(reason => {
+      if (!current()) return undefined;
+      const writer = reason instanceof Error && reason.message === 'THREAD_WRITER_CONFLICT';
+      resumeFailureRef.current = writer ? 'writer' : 'transient'; resumeNeededRef.current = !writer;
+      continuationReadyRef.current = false; setContinuationReady(false);
+      setError(errorText(reason));
+      throw reason;
+    }).finally(() => { if (resumeFlightRef.current?.key === key) resumeFlightRef.current = null; });
+    resumeFlightRef.current = { key, promise };
+    return promise;
+  }, []);
+
+  useEffect(() => {
+    if (authenticated && !recovering && status.codex === 'ready' && resumeNeededRef.current) void resumeSelected().catch(() => undefined);
+  }, [authenticated, recovering, status.codex, status.generation, resumeSelected]);
 
   useEffect(() => {
     let live = true;
@@ -418,21 +586,25 @@ export function App() {
   useEffect(() => {
     if (!authenticated) return;
     let live = true;
+    const requestedGeneration = generationRef.current;
     void Promise.allSettled([
       refreshProjects(),
-      api<ServiceStatus>('/status').then((data) => { if (live) setStatus(data); }),
+      api<ServiceStatus>('/status').then((data) => { if (live) observeStatus(data, false, requestedGeneration); }),
       api<{ data: Model[] }>('/models').then((data) => { if (live) { setModels(data.data); setModel((previous) => previous || (data.data.find((entry) => entry.isDefault) || data.data[0])?.model || ''); } }),
       refreshRequests(),
     ]).then((results) => { if (live) { const failure = results.find((result) => result.status === 'rejected'); if (failure?.status === 'rejected') setError(errorText(failure.reason)); } });
     return () => { live = false; };
-  }, [authenticated, refreshRequests, refreshProjects]);
+  }, [authenticated, refreshRequests, refreshProjects, observeStatus]);
 
   useEffect(() => {
     if (!authenticated) return;
     if (projectViewRef.current !== projectId) {
       projectViewRef.current = projectId;
+      projectEpochRef.current += 1;
+      threadPagesLoadedRef.current = false; threadCursorRef.current = null; threadPageInFlightRef.current = null; setThreadCursor(null);
+      resumeNeededRef.current = false; resumeFailureRef.current = null; continuationReadyRef.current = true;
       viewEpochRef.current += 1;
-      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); setFilesOpen(false); setContinuationReady(true); setInheritedEffort(''); setAuthorization(null);
+      setThreads([]); setThreadId(''); threadRef.current = ''; setTurns([]); setAttachments([]); setHistoryCursor(null); historyCursorRef.current = null; historyLoadedRef.current = false; historyPagedRef.current = false; prependAnchorRef.current = null; olderInFlightRef.current = false; setOlderLoading(false); setFilesOpen(false); setContinuationReady(true); setInheritedEffort(''); setAuthorization(null);
     }
     setLoading(true);
     if (!projectId) { setLoading(false); return; }
@@ -452,7 +624,7 @@ export function App() {
 
   useEffect(() => {
     if (!authenticated) return;
-    let closed = false; let socket: WebSocket | undefined; let timer: ReturnType<typeof setTimeout>; let attempts = 0;
+    let closed = false; let socket: WebSocket | undefined; let timer: ReturnType<typeof setTimeout>; let attempts = 0; let lastReceived = Date.now();
     const resync = () => {
       void refreshAccess().then(access => {
         if (closed || !access.authenticated) return;
@@ -460,23 +632,33 @@ export function App() {
         void refreshRequests();
         const id = threadRef.current; const pid = projectRef.current;
         if (id && pid) void refreshHistory(id, pid).catch(() => undefined);
+        if (id && pid && !recoveryRef.current && statusRef.current.codex === 'ready' && (!continuationReadyRef.current || resumeNeededRef.current)) void resumeSelected().catch(() => undefined);
         if (pid) void loadThreads(pid).catch(() => undefined);
-        void api<ServiceStatus>('/status').then(setStatus).catch(() => undefined);
+        const requestedGeneration = generationRef.current;
+        void api<ServiceStatus>('/status').then(data => observeStatus(data, false, requestedGeneration)).catch(() => undefined);
       }).catch(() => { /* The next reconnect retries access without clearing the current work. */ });
     };
     const connect = () => {
+      if (closed) return;
+      const previous = socket;
+      if (previous) { previous.onopen = null; previous.onclose = null; previous.onerror = null; previous.onmessage = null; previous.close(); }
+      clearTimeout(timer);
+      lastReceived = Date.now();
       setConnection('connecting');
-      socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/events?after=${sequenceRef.current}`);
-      socket.onopen = () => { if (closed) return; attempts = 0; setConnection('connected'); resync(); };
+      socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/events?after=${sequenceRef.current}${generationRef.current ? `&generation=${encodeURIComponent(generationRef.current)}` : ''}`);
+      socket.onopen = () => { if (closed) return; lastReceived = Date.now(); attempts = 0; setConnection('connected'); resync(); };
       socket.onmessage = (message) => {
         if (closed) return;
+        lastReceived = Date.now();
         let event: AppEvent; try { event = JSON.parse(string(message.data)) as AppEvent; } catch { return; }
         if (!event || typeof event.method !== 'string') return;
-        if (event.method !== 'pocketagent/reset' && event.seq > 0 && event.seq <= sequenceRef.current) return;
-        sequenceRef.current = Math.max(sequenceRef.current, event.seq || 0);
         const params = object(event.params); event.params = params;
+        const incomingStatus = (params.status || params) as unknown as ServiceStatus;
+        const newGeneration = event.method === 'pocketagent/status' && typeof incomingStatus.generation === 'string' && incomingStatus.generation !== generationRef.current;
+        if (event.method !== 'pocketagent/reset' && !newGeneration && event.seq > 0 && event.seq <= sequenceRef.current) return;
+        sequenceRef.current = Math.max(sequenceRef.current, event.seq || 0);
         if (event.method === 'pocketagent/reset') { sequenceRef.current = event.seq || 0; resync(); return; }
-        if (event.method === 'pocketagent/status') { setStatus((params.status || params) as unknown as ServiceStatus); return; }
+        if (event.method === 'pocketagent/status') { observeStatus(incomingStatus, true); sequenceRef.current = Math.max(sequenceRef.current, event.seq || 0); return; }
         if (event.method === 'pocketagent/requests') { if (Array.isArray(params.requests)) setRequests(params.requests as PendingRequest[]); return; }
         if (event.method === 'project/changed') {
           void refreshProjects().then(() => { const pid = projectRef.current; if (pid && !closed) void loadThreads(pid).catch(reason => setError(errorText(reason))); }).catch(reason => { if (!closed) setError(errorText(reason)); });
@@ -486,6 +668,12 @@ export function App() {
         if (event.method === 'thread/name/updated') setThreads((previous) => previous.map((entry) => entry.id === string(params.threadId) ? { ...entry, name: string(params.threadName) || string(params.name) } : entry));
         if (event.method === 'thread/status/changed') setThreads((previous) => previous.map((entry) => entry.id === string(params.threadId) ? { ...entry, status: object(params.status) as { type: string } } : entry));
         if (string(params.threadId) !== threadRef.current) return;
+        if (event.method === 'thread/settings/updated') {
+          const label = authorizationLabel(params.threadSettings);
+          if (label) setAuthorization(label);
+          return;
+        }
+        threadRevisionRef.current += 1;
         if (event.method === 'pocketagent/interrupted') {
           setTurns((previous) => previous.map((turn) => (!params.turnId || turn.id === params.turnId) && !terminalStatus(turn.status) ? { ...turn, status: 'interrupted' } : turn));
           setThreads((previous) => previous.map((entry) => entry.id === threadRef.current ? { ...entry, status: { type: 'systemError' } } : entry));
@@ -493,7 +681,10 @@ export function App() {
           resync(); return;
         }
         setTurns((previous) => applyThreadEvent(previous, event));
-        if (event.method === 'turn/completed') { const pid = projectRef.current; if (pid) void loadThreads(pid).catch(() => undefined); }
+        if (event.method === 'turn/completed') {
+          setThreads(previous => previous.map(entry => entry.id === string(params.threadId) ? { ...entry, status: { type: 'idle' } } : entry));
+          const pid = projectRef.current; if (pid) void loadThreads(pid).catch(() => undefined);
+        }
       };
       socket.onclose = () => {
         if (closed) return;
@@ -503,9 +694,16 @@ export function App() {
       };
       socket.onerror = () => socket?.close();
     };
+    // Mobile browsers can retain a half-open socket after sleep without firing onclose.
+    const reconnectVisible = () => { if (document.visibilityState !== 'hidden') connect(); };
+    window.addEventListener('focus', reconnectVisible);
+    window.addEventListener('online', reconnectVisible);
+    window.addEventListener('pocketagent:reconnect', reconnectVisible);
+    document.addEventListener('visibilitychange', reconnectVisible);
+    const watchdog = setInterval(() => { if (document.visibilityState !== 'hidden' && Date.now() - lastReceived > 35_000) connect(); }, 5000);
     connect();
-    return () => { closed = true; clearTimeout(timer); socket?.close(); };
-  }, [authenticated, loadThreads, refreshHistory, refreshRequests, refreshProjects, refreshAccess]);
+    return () => { closed = true; clearTimeout(timer); clearInterval(watchdog); socket?.close(); window.removeEventListener('focus', reconnectVisible); window.removeEventListener('online', reconnectVisible); window.removeEventListener('pocketagent:reconnect', reconnectVisible); document.removeEventListener('visibilitychange', reconnectVisible); };
+  }, [authenticated, loadThreads, refreshHistory, refreshRequests, refreshProjects, refreshAccess, observeStatus, resumeSelected]);
 
   useEffect(() => {
     if (!authenticated || status.codex !== 'ready') return;
@@ -540,14 +738,31 @@ export function App() {
     };
   }, [authenticated, status.codex, refreshProjects, loadThreads, refreshHistory, refreshAccess]);
 
+  useEffect(() => {
+    if (!authenticated || status.codex !== 'ready' || !threadId) return;
+    let live = true;
+    let inFlight = false;
+    const reconcile = async () => {
+      if (!live || inFlight || !workingRef.current || document.visibilityState === 'hidden') return;
+      inFlight = true;
+      try { await Promise.allSettled([refreshHistory(threadId, projectId), refreshRequests()]); }
+      finally { inFlight = false; }
+    };
+    const timer = setInterval(() => { void reconcile(); }, 5000);
+    return () => { live = false; clearInterval(timer); };
+  }, [authenticated, status.codex, threadId, projectId, refreshHistory, refreshRequests]);
+
   const chooseThread = async (entry: Thread) => {
     const epoch = ++viewEpochRef.current;
     const selectedProject = projectId;
     const isCurrentView = () => epoch === viewEpochRef.current && threadRef.current === entry.id && projectRef.current === selectedProject;
-    setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); setLoading(true); setContinuationReady(false); setModel(entry.model || ''); setEffort(''); setInheritedEffort(entry.reasoningEffort || ''); setAuthorization(null); setError(''); setAttachments([]); followRef.current = true;
+    rememberSelection(selectedProject, entry.id);
+    resumeNeededRef.current = false; resumeFailureRef.current = null; continuationReadyRef.current = false;
+    setSidebarOpen(false); setThreadId(entry.id); threadRef.current = entry.id; setTurns([]); setHistoryCursor(null); historyCursorRef.current = null; historyLoadedRef.current = false; historyPagedRef.current = false; prependAnchorRef.current = null; olderInFlightRef.current = false; setOlderLoading(false); setLoading(true); setContinuationReady(false); setModel(entry.model || ''); setEffort(''); setInheritedEffort(entry.reasoningEffort || ''); setAuthorization(null); setError(''); setAttachments([]); followRef.current = true;
     const history = refreshHistory(entry.id, selectedProject);
-    const resume = api<ThreadSession>(`/threads/${encodeURIComponent(entry.id)}/resume`, { method: 'POST', body: body({ projectId: selectedProject }) }).then(resumed => {
-      if (!isCurrentView()) return;
+    const resume = resumeSelected().then(resumed => {
+      if (!isCurrentView() || !resumed) return;
+      setThreads(previous => previous.some(value => value.id === entry.id) ? previous.map(value => value.id === entry.id ? { ...value, ...resumed.thread } : value) : [resumed.thread, ...previous]);
       setModel(typeof resumed.model === 'string' ? resumed.model : '');
       setInheritedEffort(resumed.reasoningEffort || entry.reasoningEffort || '');
       setAuthorization(authorizationLabel(resumed));
@@ -563,9 +778,63 @@ export function App() {
     setLoading(false);
     await refreshRequests();
   };
-  const newThread = () => { viewEpochRef.current += 1; const previous = effort || inheritedEffort; setEffort(selectedModel?.supportedReasoningEfforts?.some(option => option.reasoningEffort === previous) ? previous : selectedModel?.defaultReasoningEffort || ''); setInheritedEffort(''); setAuthorization(null); setLoading(false); setContinuationReady(true); setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
+  useEffect(() => {
+    if (!recovering) return;
+    const run = recoveryRef.current;
+    if (!run) return;
+    let polling = false;
+    const poll = async () => {
+      if (polling || !run.accepted || recoveryRef.current !== run) return;
+      polling = true;
+      const requestedGeneration = generationRef.current;
+      try { const next = await api<ServiceStatus>('/status', { signal: AbortSignal.timeout(5000) }); if (recoveryRef.current === run) observeStatus(next, true, requestedGeneration); }
+      catch { /* The next bounded status read can recover a closed transport. */ }
+      finally { polling = false; }
+    };
+    const timer = setInterval(() => { void poll(); }, 2000);
+    const deadline = setTimeout(() => {
+      if (recoveryRef.current !== run) return;
+      recoveryRef.current = null;
+      setRecoveryReady(0); setRecovering(false);
+      setError('恢復尚未確認完成。請使用「重新連線」檢查狀態，或再次確認緊急恢復後重試。');
+    }, 60_000);
+    return () => { clearInterval(timer); clearTimeout(deadline); };
+  }, [recovering, observeStatus]);
+  useEffect(() => {
+    const run = recoveryRef.current;
+    if (!recoveryReady || !run || run.id !== recoveryReady) return;
+    const epoch = viewEpochRef.current;
+    const id = threadRef.current; const pid = projectRef.current;
+    const current = () => recoveryRef.current === run && epoch === viewEpochRef.current && id === threadRef.current && pid === projectRef.current;
+    void (async () => {
+      try {
+        if (id && pid) {
+          resumeFailureRef.current = null;
+          const resumed = await resumeSelected();
+          if (!current() || !resumed) return;
+          setAuthorization(authorizationLabel(resumed));
+          setInheritedEffort(resumed.reasoningEffort || '');
+          setContinuationReady(true); setError('');
+          await Promise.allSettled([refreshHistory(id, pid), refreshRequests()]);
+        } else if (current()) { setContinuationReady(true); setError(''); }
+      } catch (reason) {
+        if (current()) { setContinuationReady(false); setError(reason instanceof Error && reason.message === 'THREAD_WRITER_CONFLICT' ? errorText(reason) : errorText(new Error('THREAD_RESUME_FAILED'))); }
+      } finally {
+        if (recoveryRef.current === run) { recoveryRef.current = null; setRecoveryReady(0); setRecovering(false); }
+      }
+    })();
+  }, [recoveryReady, refreshHistory, refreshRequests, resumeSelected]);
+  useEffect(() => {
+    const selection = initialSelectionRef.current;
+    if (!selection || !authenticated || !project || status.codex !== 'ready') return;
+    initialSelectionRef.current = null;
+    if (selection.projectId !== projectId || !selection.threadId) { rememberSelection(projectId); return; }
+    const entry = threads.find(value => value.id === selection.threadId) || { id: selection.threadId, preview: '', cwd: project.path, updatedAt: 0 };
+    void chooseThread(entry);
+  }, [authenticated, project, projectId, status.codex, threads]);
+  const newThread = () => { viewEpochRef.current += 1; resumeNeededRef.current = false; resumeFailureRef.current = null; continuationReadyRef.current = true; rememberSelection(projectId); const previous = effort || inheritedEffort; setEffort(selectedModel?.supportedReasoningEfforts?.some(option => option.reasoningEffort === previous) ? previous : selectedModel?.defaultReasoningEffort || ''); setInheritedEffort(''); setAuthorization(null); setLoading(false); setContinuationReady(true); setThreadId(''); threadRef.current = ''; setTurns([]); setHistoryCursor(null); historyCursorRef.current = null; historyLoadedRef.current = false; historyPagedRef.current = false; prependAnchorRef.current = null; olderInFlightRef.current = false; setOlderLoading(false); setAttachments([]); setText(''); setError(''); setSidebarOpen(false); submissionRef.current = null; setTimeout(() => composerRef.current?.focus(), 0); };
   const send = async () => {
-    if ((!text.trim() && !attachments.length) || sending || loading || !continuationReady || isWorking || !projectId || status.codex !== 'ready' || status.authenticated === false) return;
+    if ((!text.trim() && !attachments.length) || sending || recovering || loading || !continuationReady || isWorking || !projectId || status.codex !== 'ready' || status.authenticated === false) return;
     const epoch = viewEpochRef.current;
     const sendProject = projectId;
     const sentText = text;
@@ -578,13 +847,13 @@ export function App() {
         const data = await api<ThreadSession>('/threads', { method: 'POST', body: body({ projectId: sendProject, model: model || undefined, effort: effort || undefined }) });
         if (!isCurrentView()) return;
         setAuthorization(authorizationLabel(data));
-        id = data.thread.id; threadRef.current = id; setThreadId(id); setThreads((previous) => [data.thread, ...previous.filter((entry) => entry.id !== id)]);
+        id = data.thread.id; threadRef.current = id; setThreadId(id); rememberSelection(sendProject, id); setThreads((previous) => [data.thread, ...previous.filter((entry) => entry.id !== id)]);
       }
       const fingerprint = JSON.stringify({ id, text: sentText, attachmentIds: sentAttachments, model, effort });
       if (submissionRef.current?.fingerprint !== fingerprint) submissionRef.current = { fingerprint, requestId: uniqueId() };
       const data = await api<{ turn: Turn }>(`/threads/${encodeURIComponent(id)}/messages`, { method: 'POST', body: body({ projectId: sendProject, text: sentText, attachmentIds: sentAttachments, model: model || undefined, effort: effort || undefined, requestId: submissionRef.current.requestId }) });
       if (isCurrentView() && threadRef.current === id) {
-        if (data.turn) setTurns((previous) => mergeTurn(previous, data.turn));
+        if (data.turn) { threadRevisionRef.current += 1; setTurns((previous) => mergeTurn(previous, data.turn)); }
         setText((current) => current === sentText ? '' : current);
         setAttachments((current) => current.filter((entry) => !sentAttachments.includes(entry.id)));
         submissionRef.current = null;
@@ -616,16 +885,24 @@ export function App() {
   const respond = async (id: string | number, result: unknown) => { await api(`/requests/${encodeURIComponent(String(id))}`, { method: 'POST', body: body({ result }) }); await refreshRequests(); };
   const rename = async (event: FormEvent) => { event.preventDefault(); try { await api(`/threads/${encodeURIComponent(threadId)}`, { method: 'PATCH', body: body({ projectId, name: renameValue.trim() }) }); setThreads((previous) => previous.map((entry) => entry.id === threadId ? { ...entry, name: renameValue.trim() } : entry)); setRenaming(false); } catch (reason) { setError(errorText(reason)); } };
   const olderHistory = async () => {
-    if (!historyCursor) return;
+    const cursor = historyCursorRef.current;
+    if (!cursor || olderInFlightRef.current || loading) return;
     const epoch = viewEpochRef.current;
     const isCurrentView = () => viewEpochRef.current === epoch && projectRef.current === projectId && threadRef.current === threadId;
+    olderInFlightRef.current = true;
+    setOlderLoading(true);
     try {
-      const data = await api<{ data: Turn[]; nextCursor?: string | null }>(`/threads/${encodeURIComponent(threadId)}/turns?projectId=${encodeURIComponent(projectId)}&cursor=${encodeURIComponent(historyCursor)}`);
+      const data = await api<{ data: Turn[]; nextCursor?: string | null }>(`/threads/${encodeURIComponent(threadId)}/turns?projectId=${encodeURIComponent(projectId)}&limit=${HISTORY_PAGE_SIZE}&cursor=${encodeURIComponent(cursor)}`);
       if (!isCurrentView()) return;
       followRef.current = false;
-      setTurns((previous) => [...data.data.reverse().filter((entry) => !previous.some((old) => old.id === entry.id)), ...previous]);
-      setHistoryCursor(data.nextCursor || null);
+      const element = scrollRef.current;
+      if (element) prependAnchorRef.current = { epoch, offset: element.scrollHeight - element.scrollTop };
+      historyPagedRef.current = true;
+      setTurns(previous => mergeHistory([...data.data].reverse(), previous));
+      historyCursorRef.current = data.nextCursor && data.nextCursor !== cursor ? data.nextCursor : null;
+      setHistoryCursor(historyCursorRef.current);
     } catch (reason) { if (isCurrentView()) setError(errorText(reason)); }
+    finally { if (isCurrentView()) { olderInFlightRef.current = false; setOlderLoading(false); } }
   };
   const changePairing = async (required: boolean) => {
     if (pairingBusy) return;
@@ -643,6 +920,32 @@ export function App() {
       void refreshAccess().catch(() => { /* Recheck on the next focus or reconnect if the network failed. */ });
     }
   };
+  const recover = async () => {
+    if (recoveryRef.current) return;
+    const run = { id: ++recoveryIdRef.current, accepted: false, sawUnavailable: false, generation: generationRef.current };
+    const epoch = viewEpochRef.current;
+    const previousReady = continuationReady;
+    recoveryRef.current = run;
+    setRecovering(true); setRecoveryReady(0); continuationReadyRef.current = false; setContinuationReady(false); setError('');
+    const signal = AbortSignal.timeout(15_000);
+    try {
+      await api<{ accepted: boolean }>('/recovery', { method: 'POST', body: body({ confirm: true }), signal });
+      if (recoveryRef.current !== run) return;
+      run.accepted = true;
+      if ((run.sawUnavailable || (run.generation && generationRef.current !== run.generation)) && statusRef.current.codex === 'ready') setRecoveryReady(run.id);
+    } catch (reason) {
+      if (recoveryRef.current !== run) return;
+      if (signal.aborted) {
+        run.accepted = true;
+        setError('恢復要求的回應逾時，正在確認服務狀態。');
+        if ((run.sawUnavailable || (run.generation && generationRef.current !== run.generation)) && statusRef.current.codex === 'ready') setRecoveryReady(run.id);
+      } else {
+        recoveryRef.current = null; setRecovering(false);
+        if (epoch === viewEpochRef.current) { continuationReadyRef.current = previousReady; setContinuationReady(previousReady); }
+        setError(errorText(reason));
+      }
+    }
+  };
   const logout = async () => { try { await api('/auth/logout', { method: 'POST' }); await refreshAccess(); } catch (reason) { setError(errorText(reason)); } };
 
   if (authenticated === null) return <div className="boot-screen"><Mark /><span>正在連接工作空間<span className="loading-dots">…</span></span></div>;
@@ -650,24 +953,24 @@ export function App() {
   return <div className="app-shell">
     {sidebarOpen ? <button className="sidebar-backdrop" aria-label="收起選單" onClick={() => setSidebarOpen(false)} /> : null}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}><header className="brand"><Mark /><div><strong>PocketAgent</strong><span>你的工作，隨身接續。</span></div><button className="icon-button sidebar-close" aria-label="關閉選單" onClick={() => setSidebarOpen(false)}><Icon name="close" /></button></header>
-      <div className="project-label">Codex 專案 <span>PROJECTS</span></div><div className="project-picker"><Icon name="folder" size={19} /><select aria-label="切換 Codex 專案" aria-busy={projectsLoading} disabled={waitingForProjects} value={projectId} onChange={(event) => { projectRef.current = event.target.value; setProjectId(event.target.value); }}>{projects.length ? projects.map((entry) => <option value={entry.id} key={entry.id}>{entry.name}</option>) : <option value="">{waitingForProjects ? catalogLoadingText : '尚無 Codex 專案'}</option>}</select><Icon name="chevron" size={13} /></div>
+      <div className="project-label">Codex 專案 <span>PROJECTS</span></div><div className="project-picker"><Icon name="folder" size={19} /><select aria-label="切換 Codex 專案" aria-busy={projectsLoading} disabled={waitingForProjects} value={projectId} onChange={(event) => { initialSelectionRef.current = null; rememberSelection(event.target.value); projectRef.current = event.target.value; setProjectId(event.target.value); }}>{projects.length ? projects.map((entry) => <option value={entry.id} key={entry.id}>{entry.name}</option>) : <option value="">{waitingForProjects ? catalogLoadingText : '尚無 Codex 專案'}</option>}</select><Icon name="chevron" size={13} /></div>
       <button className="new-thread-button" onClick={newThread} disabled={!projectId}><Icon name="plus" size={18} />新增對話<span>＋</span></button>
       <div className="session-label">最近的對話<button className="icon-button" aria-label="重新整理對話" onClick={() => void loadThreads(projectId).catch((reason) => setError(errorText(reason)))} disabled={!projectId}><Icon name="refresh" size={14} /></button></div>
       <nav className="session-list" aria-label="對話紀錄">{threads.map((entry) => <button className={`session-row ${entry.id === threadId ? 'active' : ''}`} key={entry.id} onClick={() => void chooseThread(entry)}><Icon name="chat" size={16} /><span><strong>{entry.name || entry.preview || '新的對話'}</strong><small>{entry.status?.type === 'active' ? <><span className="status-dot online" />執行中</> : entry.id === threadId ? '目前的對話' : '點選以接續工作'}</small></span><time>{dateLabel(entry.updatedAt)}</time>{requests.some((request) => request.params.threadId === entry.id) ? <span className="request-dot" title="等待回覆" /> : null}</button>)}{!threads.length ? <div className="no-sessions"><Icon name="chat" size={25} /><p>{waitingForProjects ? catalogLoadingText : loading ? '正在讀取對話…' : '從一個新對話開始。'}<br /><span>{loading || waitingForProjects ? '稍候就能接續工作' : '這個 Codex 專案的對話會出現在這裡。'}</span></p></div> : null}{threadCursor ? <button className="load-more" onClick={() => void loadThreads(projectId, threadCursor).catch((reason) => setError(errorText(reason)))}>載入更早的對話</button> : null}</nav>
-      <AccessFooter required={pairingRequired} paired={paired} connection={connection} busy={pairingBusy} onPairingChange={required => void changePairing(required)} onLogout={() => void logout()} />
+      <AccessFooter required={pairingRequired} paired={paired} connection={connection} busy={pairingBusy} onPairingChange={required => void changePairing(required)} onLogout={() => void logout()} onReconnect={() => window.dispatchEvent(new Event('pocketagent:reconnect'))} onRecover={recover} recovering={recovering} />
     </aside>
     <main className="workspace"><header className="workspace-header"><div className="workspace-breadcrumb"><button className="icon-button mobile-menu" aria-label="開啟專案與對話" onClick={() => setSidebarOpen(true)}><Icon name="menu" size={20} /></button><span className="breadcrumb-project">{project?.name || 'Codex 專案'}</span><span className="breadcrumb-divider">/</span><span className="breadcrumb-thread">{selectedThread?.name || selectedThread?.preview || '新的對話'}</span></div><div className="workspace-actions"><span className={`service-pill ${status.codex === 'ready' ? 'ready' : ''}`}><span className={`status-dot ${status.codex === 'ready' ? 'online' : ''}`} /><span>{status.codex === 'ready' ? 'Codex 已就緒' : status.codex === 'starting' ? 'Codex 啟動中' : 'Codex 未連線'}</span></span>{threadId ? <button className="icon-button rename-button" aria-label="重新命名對話" title="重新命名對話" onClick={() => { setRenameValue(selectedThread?.name || ''); setRenaming(true); }}><Icon name="edit" size={17} /></button> : null}<button className={`icon-button file-toggle ${filesOpen ? 'selected' : ''}`} aria-label="瀏覽專案檔案" title="瀏覽專案檔案" disabled={!project} onClick={() => setFilesOpen(!filesOpen)}><Icon name="folder" size={19} /></button></div></header>
       {connection === 'disconnected' ? <div className="connection-banner"><Icon name="refresh" size={14} />連線暫時中斷，電腦上的工作仍會繼續。正在重新連線…</div> : null}
       {status.codex === 'ready' && status.authenticated === false ? <div className="connection-banner warning"><Icon name="shield" size={14} />Codex 尚未登入。請在電腦執行 codex login，完成後重新啟動服務。</div> : null}
       {status.codex === 'offline' ? <div className="connection-banner warning"><Icon name="terminal" size={14} />Codex 尚未就緒。請在電腦上確認 CLI 安裝與登入狀態。</div> : null}
-      <div className="workspace-body"><div className="conversation-column"><div className="conversation-scroll" ref={scrollRef} onScroll={() => { const element = scrollRef.current; if (element) followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 160; }}>
-        {waitingForProjects ? <div className="welcome"><span className="spinner" /><p>{catalogLoadingText}</p></div> : !itemCount && !loading ? <div className="welcome"><div className="welcome-eyebrow"><span className="tiny-line" />YOUR DESK, IN YOUR POCKET</div><div className="welcome-symbol"><Icon name="code" size={36} /></div><h1>靈感在哪，<br /><span>工作就從哪開始。</span></h1><p>{project ? <>已連上 <strong>{project.name}</strong>。<br />交代下一步，讓電腦上的 Codex 接手。</> : <>請先在 Codex 桌面版加入專案，<br />再重新整理網頁以接續對話。</>}</p><div className="welcome-tools"><span><Icon name="folder" size={15} />本機專案</span><span><Icon name="chat" size={15} />接續紀錄</span><span><Icon name="image" size={15} />圖片輸入</span></div><div className="welcome-hint"><Icon name="shield" size={15} /><span>工作在你的電腦執行，離開網頁也會繼續。</span></div></div> : <div className="messages">{historyCursor ? <button className="history-button" onClick={() => void olderHistory()}><Icon name="refresh" size={14} />載入更早的訊息</button> : null}{turns.map((turn) => <div className="turn" key={turn.id}>{turn.items.map((item) => <MessageItem item={item} key={item.id} />)}{turn.error ? <div className="turn-error"><Icon name="close" size={15} />{turn.error.message || '這項工作未完成。'}</div> : null}{turn.status === 'interrupted' ? <div className="turn-note">工作已中斷，可傳送新訊息接續。</div> : null}</div>)}{isWorking ? <div className="working-indicator"><span /><span /><span /><p>{currentRequests.length ? '等待你的回覆' : 'Codex 正在處理工作'}</p></div> : null}</div>}
+      <div className="workspace-body"><div className="conversation-column"><div className="conversation-scroll" ref={scrollRef} onScroll={() => { const element = scrollRef.current; if (!element) return; const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 160; followRef.current = atBottom; if (!atBottom && element.scrollTop < 80) void olderHistory(); }}>
+        {waitingForProjects ? <div className="welcome"><span className="spinner" /><p>{catalogLoadingText}</p></div> : !itemCount && !loading ? <div className="welcome"><div className="welcome-eyebrow"><span className="tiny-line" />YOUR DESK, IN YOUR POCKET</div><div className="welcome-symbol"><Icon name="code" size={36} /></div><h1>靈感在哪，<br /><span>工作就從哪開始。</span></h1><p>{project ? <>已連上 <strong>{project.name}</strong>。<br />交代下一步，讓電腦上的 Codex 接手。</> : <>請先在 Codex 桌面版加入專案，<br />再重新整理網頁以接續對話。</>}</p><div className="welcome-tools"><span><Icon name="folder" size={15} />本機專案</span><span><Icon name="chat" size={15} />接續紀錄</span><span><Icon name="image" size={15} />圖片輸入</span></div><div className="welcome-hint"><Icon name="shield" size={15} /><span>工作在你的電腦執行，離開網頁也會繼續。</span></div></div> : <div className="messages">{historyCursor ? <button className="history-button" disabled={olderLoading || loading} onClick={() => void olderHistory()}><Icon name="refresh" size={14} />{olderLoading ? '正在載入更早的訊息…' : '載入更早的訊息'}</button> : null}{turns.map((turn) => <div className="turn" key={turn.id}>{turn.items.map((item) => <MessageItem item={item} key={item.id} />)}{turn.error ? <div className="turn-error"><Icon name="close" size={15} />{turn.error.message || '這項工作未完成。'}</div> : null}{turn.status === 'interrupted' ? <div className="turn-note">工作已中斷，可傳送新訊息接續。</div> : null}</div>)}{isWorking ? <div className="working-indicator"><span /><span /><span /><p>{currentRequests.length ? '等待你的回覆' : 'Codex 正在處理工作'}</p></div> : null}</div>}
         {loading ? <div className="history-loading"><span className="spinner" />正在讀取對話…</div> : null}
         {currentRequests.length ? <div className="pending-requests">{currentRequests.map((request) => <PendingCard key={request.id} request={request} onRespond={respond} />)}</div> : null}<div ref={endRef} className="scroll-anchor" /></div>
         <div className="composer-area">{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="關閉錯誤訊息" onClick={() => setError('')}><Icon name="close" size={15} /></button></div> : null}<form className={`composer ${sending ? 'busy' : ''}`} onSubmit={(event) => { event.preventDefault(); void send(); }}>
           {attachments.length ? <div className="attachment-list">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}><img src={`/api/uploads/${encodeURIComponent(attachment.id)}`} alt={attachment.name} /><span>{attachment.name}</span><button type="button" className="icon-button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((previous) => previous.filter((entry) => entry.id !== attachment.id))}><Icon name="close" size={13} /></button></div>)}</div> : null}
           <textarea ref={composerRef} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !window.matchMedia('(pointer: coarse)').matches) { event.preventDefault(); void send(); } }} onPaste={(event) => { const imageFiles = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/')); if (imageFiles.length) { event.preventDefault(); void upload(imageFiles); } }} placeholder={isWorking ? '工作進行中，完成後可傳送下一則訊息…' : '交代下一步，或附上一張圖片…'} aria-label="傳送給 Codex 的訊息" rows={2} disabled={!projectId} />
-          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => { const next = models.find(entry => entry.model === event.target.value); setModel(event.target.value); setEffort(next?.defaultReasoningEffort || ""); setInheritedEffort(""); }} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div><div className="reasoning-picker"><span>思考</span><select aria-label="思考強度" value={effort} onChange={event => setEffort(event.target.value)} disabled={isWorking || sending || loading || !selectedModel?.supportedReasoningEfforts?.length}><ReasoningOptions model={selectedModel} inherited={inheritedEffort} /></select></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || uploading || loading || !continuationReady || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />{authorization || (threadId ? '沿用 Codex 對話授權' : '沿用 Codex 專案授權')}</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
+          <div className="composer-toolbar"><div className="composer-options"><input className="visually-hidden" ref={uploadRef} type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><button type="button" className="icon-button attach-button" aria-label="上傳圖片" title="上傳圖片（每張最多 10 MiB）" disabled={uploading || !projectId || isWorking} onClick={() => uploadRef.current?.click()}>{uploading ? <span className="spinner small-spinner" /> : <Icon name="plus" size={20} />}</button><span className="toolbar-divider" /><div className="model-picker"><Icon name="code" size={14} /><select aria-label="選擇模型" value={model} onChange={(event) => { const next = models.find(entry => entry.model === event.target.value); setModel(event.target.value); setEffort(next?.defaultReasoningEffort || ""); setInheritedEffort(""); }} disabled={isWorking || sending || loading}><ModelOptions models={models} model={model} /></select><Icon name="chevron" size={11} /></div><div className="reasoning-picker"><span>思考</span><select aria-label="思考強度" value={effort} onChange={event => setEffort(event.target.value)} disabled={isWorking || sending || loading || !selectedModel?.supportedReasoningEfforts?.length}><ReasoningOptions model={selectedModel} inherited={inheritedEffort} /></select></div></div>{isWorking ? <button type="button" className="send-button stop-button" aria-label="停止工作" title="停止工作" onClick={() => void interrupt()}><Icon name="stop" size={18} /></button> : <button type="submit" className="send-button" aria-label="傳送訊息" title="傳送訊息" disabled={sending || recovering || uploading || loading || !continuationReady || (!text.trim() && !attachments.length) || !projectId || status.codex !== 'ready' || status.authenticated === false}>{sending ? <span className="spinner dark-spinner" /> : <Icon name="arrow" size={21} />}</button>}</div></form><div className="composer-caption"><span><Icon name="shield" size={11} />{authorization || (threadId ? '沿用 Codex 對話授權' : '沿用 Codex 專案授權')}</span><span className="keyboard-hint">Enter 傳送 · Shift + Enter 換行</span></div></div>
       </div>{filesOpen && project ? <FileBrowser key={project.id} project={project} onClose={() => setFilesOpen(false)} /> : null}</div>
     </main>
     {renaming ? <div className="modal-backdrop" onClick={() => setRenaming(false)}><form className="rename-modal" onClick={(event) => event.stopPropagation()} onSubmit={(event) => void rename(event)}><h2>重新命名對話</h2><label htmlFor="thread-name">對話名稱</label><input id="thread-name" value={renameValue} onChange={(event) => setRenameValue(event.target.value)} maxLength={100} autoFocus required /><div><button type="button" className="button subtle" onClick={() => setRenaming(false)}>取消</button><button className="button accent" disabled={!renameValue.trim()}>儲存名稱</button></div></form></div> : null}

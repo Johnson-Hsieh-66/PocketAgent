@@ -5,18 +5,19 @@ import { createServer, type Server } from 'node:net';
 import { loadConfig } from './config.js';
 import { Store } from './store.js';
 import { Files } from './files.js';
-import { CodexBridge } from './codex.js';
+import { WorkerClient } from './worker-client.js';
 import { buildApp } from './http.js';
-import { resolveCodex } from './launcher.js';
 import { NetworkListeners } from './network.js';
 import { ProjectCatalog } from './projects.js';
-import { createDiagnosticLogger, type DiagnosticSink } from './diagnostics.js';
+import type { DiagnosticSink } from './diagnostics.js';
 
-let writeDiagnostic: DiagnosticSink = createDiagnosticLogger();
+let writeDiagnostic: DiagnosticSink = () => {};
 
 async function main() {
 const config = await loadConfig();
-writeDiagnostic = createDiagnosticLogger(config.dataDir);
+const worker = new WorkerClient({ dataDir: config.dataDir });
+// The worker is the single diagnostic writer and survives HTTP deployments.
+writeDiagnostic = entry => worker.diagnostic(entry);
 writeDiagnostic({ component: 'server', code: 'SERVICE_STARTING', operation: 'startup' });
 await mkdir(config.dataDir, { recursive: true });
 const servicePath = path.join(config.dataDir, 'service.json');
@@ -53,7 +54,7 @@ async function lock() {
 await lock();
 await writeFile(servicePath, JSON.stringify(service), { mode: 0o600 });
 let stopping = false;
-let bridge: CodexBridge | undefined;
+let bridge: WorkerClient | undefined;
 let store: Store | undefined;
 let listeners: NetworkListeners | undefined;
 function diagnostic(code: string) { writeDiagnostic({ component: 'server', code, operation: 'startup' }); }
@@ -63,7 +64,7 @@ async function clean() {
   writeDiagnostic({ component: 'server', code: 'SERVICE_STOPPING', operation: 'shutdown' });
   listeners?.pause();
   listeners?.terminateClients();
-  await bridge?.stop().catch(() => {});
+  await worker.close();
   await listeners?.close().catch(() => {});
   store?.close();
   for (const file of [servicePath, lockPath]) {
@@ -79,16 +80,16 @@ process.on('unhandledRejection', () => { diagnostic('UNHANDLED_REJECTION'); void
 try {
   if (!stopping) {
     store = new Store(config.dataDir);
-    bridge = new CodexBridge(resolveCodex(config.codexPath), store, writeDiagnostic);
+    bridge = worker;
     const catalog = new ProjectCatalog(config, bridge);
     const files = new Files(config, store, catalog);
-    const shared = { store, bridge, files, diagnostic: writeDiagnostic };
+    const shared = { store, bridge, files, diagnostic: writeDiagnostic, disconnectClients: () => listeners?.terminateClients() };
     listeners = new NetworkListeners(config, host => buildApp({ config: { ...config, host }, ...shared }), {
       diagnostic: code => writeDiagnostic({ component: 'network', code, operation: 'listeners' }),
     });
     await listeners.start();
-    await bridge.start().catch(() => diagnostic('CODEX_UNAVAILABLE'));
-    const retry = setInterval(() => { if (!stopping && bridge?.status.codex === 'offline') void bridge.start().catch(() => diagnostic('CODEX_UNAVAILABLE')); }, 30_000);
+    await bridge.connect().catch(() => diagnostic('WORKER_UNAVAILABLE'));
+    const retry = setInterval(() => { if (!stopping) void worker.connect().catch(() => diagnostic('WORKER_UNAVAILABLE')); }, 5000);
     retry.unref();
   }
 } catch { diagnostic('STARTUP_FAILED'); await clean(); process.exitCode = 1; }

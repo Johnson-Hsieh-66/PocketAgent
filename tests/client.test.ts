@@ -13,6 +13,7 @@ describe('effective Codex authorization summary', () => {
   it('describes actual access and reviewer settings instead of assuming workspace write', () => {
     expect(authorizationLabel({ sandbox: { type: 'readOnly' }, approvalPolicy: 'on-request', approvalsReviewer: 'user' })).toBe('唯讀 · 需要時核准');
     expect(authorizationLabel({ sandbox: { type: 'workspaceWrite' }, approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' })).toBe('工作區寫入 · 自動審核');
+    expect(authorizationLabel({ sandboxPolicy: { type: 'workspaceWrite' }, approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' })).toBe('工作區寫入 · 自動審核');
     expect(authorizationLabel({ sandbox: { type: 'dangerFullAccess' }, approvalPolicy: 'never', approvalsReviewer: 'auto_review' })).toBe('完整存取 · 不需核准');
     expect(authorizationLabel({ sandbox: { type: 'workspaceWrite' }, activePermissionProfile: { id: ':workspace' }, approvalPolicy: { granular: {} } })).toBe('工作區寫入 · 依授權規則核准');
   });
@@ -24,6 +25,18 @@ describe('effective Codex authorization summary', () => {
 });
 
 describe('recoverable API errors', () => {
+  it('bounds read requests and reports timeout without retrying them automatically', async () => {
+    const timeout = new AbortController();
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(timeout.signal);
+    const fetch = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => options.signal!.addEventListener('abort', () => reject(options.signal!.reason), { once: true })));
+    vi.stubGlobal('fetch', fetch);
+    const request = api('/status').catch((reason: unknown) => reason);
+    timeout.abort();
+    expect((await request as Error).message).toBe('REQUEST_TIMEOUT');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
+  });
+
   it('retains the submission code for recovery while rendering a Chinese warning against accidental replay', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: 'REQUEST_ALREADY_SUBMITTED' }), { status: 409 })));
     const failure = await api('/threads/fixture-thread/messages', { method: 'POST', body: '{}' }).catch((reason: unknown) => reason);
@@ -66,27 +79,26 @@ describe('pairing input regression', () => {
 });
 
 describe('optional device pairing', () => {
-  const renderAccess = (required: boolean, paired: boolean, busy = false) => renderToStaticMarkup(createElement(AccessFooter, { required, paired, busy, connection: 'connected', onPairingChange: vi.fn(), onLogout: vi.fn() }));
+  const renderAccess = (required: boolean, paired: boolean, busy = false) => renderToStaticMarkup(createElement(AccessFooter, { required, paired, busy, connection: 'connected', onPairingChange: vi.fn(), onLogout: vi.fn(), onReconnect: vi.fn(), onRecover: vi.fn(), recovering: false }));
 
   it('renders anonymous private-network access with pairing off and no misleading logout', () => {
     const markup = renderAccess(false, false);
     const control = markup.match(/<input\b[^>]*\brole="switch"[^>]*>/)?.[0] || '';
     expect(markup).toContain('免配對');
     expect(markup).toContain('私人連線');
-    expect(markup).toContain('要求裝置配對');
-    expect(markup).toContain('關閉時，能連到服務的裝置可直接使用。');
-    expect(control).not.toMatch(/\bchecked(?:="")?/);
+    expect(markup).toContain('設定');
+    expect(markup).not.toContain('要求裝置配對');
+    expect(control).toBe('');
     expect(markup).not.toContain('移除此裝置配對');
   });
 
-  it('shows the real paired state and disables duplicate mode changes while saving', () => {
+  it('shows the real paired state while keeping access controls behind settings', () => {
     const markup = renderAccess(true, true, true);
     const control = markup.match(/<input\b[^>]*\brole="switch"[^>]*>/)?.[0] || '';
-    expect(control).toMatch(/\bchecked(?:="")?/);
-    expect(control).toMatch(/\bdisabled(?:="")?/);
+    expect(control).toBe('');
     expect(markup).toContain('裝置已配對');
     expect(markup).toContain('移除此裝置配對');
-    expect(markup).toContain('儲存中');
+    expect(markup).toContain('設定');
   });
 
   it('rechecks access on protected API rejection without treating a bad pairing code as a session logout', async () => {
@@ -146,6 +158,30 @@ describe('mobile conversation event reconciliation', () => {
   it('does not erase active items when turn acknowledgement has no items', () => {
     const merged = mergeTurn([turn('Streaming reply')], { id: 'fixture-turn', status: 'inProgress', items: [] });
     expect(merged[0].items[0].text).toBe('Streaming reply');
+  });
+
+  it('preserves output through a delayed start and trusts the canonical completed item', () => {
+    let state = applyThreadEvent([], event('item/agentMessage/delta', { itemId: 'fixture-message', delta: 'Complete streamed output' }));
+    state = applyThreadEvent(state, event('item/started', { item: { id: 'fixture-message', type: 'agentMessage', text: '' } }));
+    expect(state[0].items[0].text).toBe('Complete streamed output');
+    state = applyThreadEvent(state, event('item/completed', { item: { id: 'fixture-message', type: 'agentMessage', text: 'Complete' } }));
+    expect(state[0].items[0].text).toBe('Complete');
+  });
+
+  it('does not append a delta twice when a leading history snapshot already contains it', () => {
+    let state = applyThreadEvent([], event('item/agentMessage/delta', { itemId: 'fixture-message', delta: 'Hel' }));
+    state = mergeHistory(state, [turn('Hello')]);
+    state = applyThreadEvent(state, event('item/agentMessage/delta', { itemId: 'fixture-message', delta: 'lo' }));
+    expect(state[0].items[0].text).toBe('Hello');
+    state = applyThreadEvent(state, event('item/agentMessage/delta', { itemId: 'fixture-message', delta: ' world' }));
+    expect(state[0].items[0].text).toBe('Hello world');
+  });
+
+  it('corrects polluted output with terminal history and ignores late replay deltas', () => {
+    let state = mergeHistory([turn('Hellolo')], [turn('Hello', 'completed')]);
+    state = applyThreadEvent(state, event('item/agentMessage/delta', { itemId: 'fixture-message', delta: 'lo' }));
+    expect(state[0].items[0].text).toBe('Hello');
+    expect(state[0].status).toBe('completed');
   });
 
   it('keeps command output independently from agent text and reconciles completion', () => {

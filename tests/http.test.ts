@@ -23,6 +23,7 @@ class FakeBridge extends EventEmitter {
   createdThreadIds(projectId: string) { return [...this.created].filter(([, id]) => id === projectId).map(([id]) => id); }
   startTurn = vi.fn(async (_id: string, _params: unknown, _requestId: string) => ({ turn: { id: 'synthetic-turn', status: 'inProgress', items: [] } }));
   interrupt = vi.fn(async () => ({}));
+  recover = vi.fn(async () => {});
   eventsSince(after: number) { return { events: this.history.filter(event => event.seq > after), reset: after > 100 }; }
   respond(id: string | number, result: unknown) { this.response(id, result); }
   request = vi.fn<(method: string, params: any) => Promise<any>>(async (method: string, params: any) => {
@@ -74,12 +75,80 @@ describe('private HTTP boundary and project access', () => {
     store?.close();
     await rm(temp, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   });
+  it('serves rebuilt assets without restarting and never falls back to HTML for missing JavaScript', async () => {
+    const staticDir = path.join(temp, 'synthetic-web');
+    await mkdir(path.join(staticDir, 'assets'), { recursive: true });
+    await writeFile(path.join(staticDir, 'index.html'), '<!doctype html><script type="module" src="/assets/old.js"></script>');
+    await writeFile(path.join(staticDir, 'assets', 'old.js'), 'export const synthetic = "old";');
+    const web = await buildApp({ config: { ...config, staticDir }, store, files, bridge });
+    try {
+      await web.ready();
+      expect((await web.inject({ url: '/assets/old.js', headers })).headers['content-type']).toMatch(/javascript/);
+      // Model a new Vite build replacing hashes after HTTP routes already exist.
+      await writeFile(path.join(staticDir, 'assets', 'new.js'), 'export const synthetic = "new";');
+      await writeFile(path.join(staticDir, 'index.html'), '<!doctype html><script type="module" src="/assets/new.js"></script>');
+      await rm(path.join(staticDir, 'assets', 'old.js'));
+      const page = await web.inject({ url: '/', headers });
+      expect(page.statusCode).toBe(200);
+      expect(page.body).toContain('/assets/new.js');
+      expect(page.headers['cache-control']).toBe('no-store');
+      const asset = await web.inject({ url: '/assets/new.js', headers });
+      expect(asset.statusCode).toBe(200);
+      expect(asset.headers['content-type']).toMatch(/javascript/);
+      expect(asset.body).toBe('export const synthetic = "new";');
+      const missing = await web.inject({ url: '/assets/old.js?cache=synthetic', headers });
+      expect(missing.statusCode).toBe(404);
+      expect(missing.headers['content-type']).not.toMatch(/html/);
+      expect((await web.inject({ url: '/api/not-real', headers: { ...headers, cookie } })).statusCode).toBe(404);
+      expect((await web.inject({ url: '/synthetic-navigation', headers })).body).toContain('/assets/new.js');
+    } finally { await web.close(); }
+  });
   it('requires paired authentication and rejects invalid Host, Origin and originless mutations', async () => {
     expect((await app.inject({ url: '/api/projects', headers })).statusCode).toBe(401);
     expect((await app.inject({ url: '/api/projects', headers: { ...headers, cookie, host: 'attacker.invalid:3000' } })).statusCode).toBe(403);
     expect((await app.inject({ url: '/api/projects', headers: { ...headers, cookie, origin: 'http://attacker.invalid' } })).statusCode).toBe(403);
     expect((await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { host: headers.host, cookie } })).statusCode).toBe(403);
     expect((await app.inject({ url: '/api/projects', headers: { ...headers, cookie } })).json().projects).toHaveLength(1);
+  });
+  it('requires authenticated explicit confirmation for recovery and remains available while Codex recovery is pending', async () => {
+    const recoverRequest = { method: 'POST' as const, url: '/api/recovery', payload: { confirm: true } };
+    expect((await app.inject({ ...recoverRequest, headers })).statusCode).toBe(401);
+    expect((await app.inject({ ...recoverRequest, headers: { host: headers.host, cookie } })).statusCode).toBe(403);
+    expect((await app.inject({ ...recoverRequest, headers: { ...headers, cookie, origin: 'http://attacker.invalid' } })).statusCode).toBe(403);
+    for (const payload of [{}, { confirm: false }, { confirm: 'true' }, { confirm: true, extra: true }]) {
+      expect((await app.inject({ ...recoverRequest, headers: { ...headers, cookie }, payload })).statusCode).toBe(400);
+    }
+    expect(bridge.recover).not.toHaveBeenCalled();
+    let release!: () => void;
+    bridge.recover.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    bridge.status = { codex: 'offline' };
+    bridge.request.mockImplementation(async () => { throw new Error('CODEX_OFFLINE'); });
+    const accepted = await app.inject({ ...recoverRequest, headers: { ...headers, cookie } });
+    expect(accepted.statusCode).toBe(202);
+    expect(accepted.json()).toEqual({ accepted: true });
+    expect(bridge.recover).toHaveBeenCalledOnce();
+    expect((await app.inject({ url: '/api/status', headers: { ...headers, cookie } })).statusCode).toBe(200);
+    expect(bridge.request).not.toHaveBeenCalled();
+    expect(bridge.startTurn).not.toHaveBeenCalled();
+    release();
+  });
+  it('disconnects event clients on all shared listeners for confirmed recovery', async () => {
+    const disconnectClients = vi.fn(() => {
+      for (const listener of [app, recoveryApp]) for (const client of listener.websocketServer.clients) client.terminate();
+    });
+    const recoveryApp: FastifyInstance = await buildApp({ config, store, files, bridge, disconnectClients });
+    await recoveryApp.ready();
+    const first = await app.injectWS('/api/events', { headers: { ...headers, cookie } });
+    const second = await recoveryApp.injectWS('/api/events', { headers: { ...headers, cookie } });
+    try {
+      const closed = Promise.all([once(first, 'close'), once(second, 'close')]);
+      const accepted = await recoveryApp.inject({ method: 'POST', url: '/api/recovery', headers: { ...headers, cookie }, payload: { confirm: true } });
+      expect(accepted.statusCode).toBe(202);
+      await closed;
+      expect(disconnectClients).toHaveBeenCalledOnce();
+      expect(bridge.listenerCount('event')).toBe(0);
+      expect(bridge.startTurn).not.toHaveBeenCalled();
+    } finally { first.terminate(); second.terminate(); await recoveryApp.close(); }
   });
   it('keeps Host, Origin and pairing checks independent on LAN and Tailscale listeners sharing one service', async () => {
     const hosts = [[192, 168, 50, 42], [100, 70, 50, 42]].map(octets => octets.join('.'));
@@ -310,6 +379,65 @@ describe('private HTTP boundary and project access', () => {
     expect(history.json().data).toHaveLength(1);
     expect(bridge.startTurn).not.toHaveBeenCalled();
   });
+  it('loads a small newest history page and validates page sizes before requesting history', async () => {
+    const url = `/api/threads/synthetic-thread/turns?projectId=${projectId}`;
+    expect((await app.inject({ url, headers: { ...headers, cookie } })).statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/turns/list', { threadId: 'synthetic-thread', limit: 6, sortDirection: 'desc', itemsView: 'full' });
+    expect((await app.inject({ url: url + '&limit=3&cursor=synthetic-older-page', headers: { ...headers, cookie } })).statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/turns/list', { threadId: 'synthetic-thread', limit: 3, sortDirection: 'desc', itemsView: 'full', cursor: 'synthetic-older-page' });
+    for (const limit of ['0', '21', '-1', '1.5', 'all']) {
+      bridge.request.mockClear();
+      expect((await app.inject({ url: url + `&limit=${limit}`, headers: { ...headers, cookie } })).statusCode).toBe(400);
+      expect(bridge.request.mock.calls.some(([method]) => method === 'thread/turns/list')).toBe(false);
+    }
+  });
+  it('bounds legacy thread reads and keeps remaining sessions reachable through opaque cursors', async () => {
+    const ids = Array.from({ length: 45 }, (_, index) => `synthetic-legacy-${index}`);
+    legacyAssignments[projectId] = ids;
+    bridge.request.mockImplementation(async (method, rpcParams) => {
+      if (method === 'thread/list') return { data: [], nextCursor: null };
+      if (method === 'thread/read') return { thread: { id: rpcParams.threadId, projectId: null, cwd: bridge.cwd, preview: 'Synthetic', updatedAt: 1 } };
+      return {};
+    });
+    const loaded: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 3; page++) {
+      bridge.request.mockClear();
+      const response = await app.inject({ url: `/api/threads?projectId=${projectId}${cursor ? '&cursor=' + encodeURIComponent(cursor) : ''}`, headers: { ...headers, cookie } });
+      expect(response.statusCode).toBe(200);
+      const result: { data: { id: string }[]; nextCursor: string | null } = response.json();
+      expect(result.data.length).toBeLessThanOrEqual(20);
+      expect(bridge.request.mock.calls.filter(([method]) => method === 'thread/read').length).toBeLessThanOrEqual(20);
+      loaded.push(...result.data.map((thread: any) => thread.id));
+      cursor = result.nextCursor;
+    }
+    expect(cursor).toBeNull();
+    expect(loaded).toEqual(ids);
+    expect(bridge.request.mock.calls.some(([method]) => method === 'thread/list')).toBe(false);
+    expect((await app.inject({ url: `/api/threads?projectId=${projectId}&cursor=pocketagent:1:invalid`, headers: { ...headers, cookie } })).statusCode).toBe(400);
+  });
+  it('does not skip a draft when canonical metadata removes earlier transient assignments between pages', async () => {
+    const ids = ['synthetic-draft-a', 'synthetic-draft-b', 'synthetic-draft-c'];
+    for (const id of ids) bridge.created.set(id, projectId);
+    bridge.request.mockImplementation(async (method, rpcParams) => {
+      if (method === 'thread/list') return { data: [], nextCursor: null };
+      if (method === 'thread/read') {
+        bridge.created.delete(rpcParams.threadId);
+        return { thread: { id: rpcParams.threadId, projectId, cwd: bridge.cwd, preview: 'Synthetic', updatedAt: 1 } };
+      }
+      return {};
+    });
+    const loaded: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 3; page++) {
+      const response = await app.inject({ url: `/api/threads?projectId=${projectId}&limit=1${cursor ? '&cursor=' + encodeURIComponent(cursor) : ''}`, headers: { ...headers, cookie } });
+      const result: { data: { id: string }[]; nextCursor: string | null } = response.json();
+      loaded.push(...result.data.map(thread => thread.id));
+      cursor = result.nextCursor;
+    }
+    expect(loaded).toEqual(ids);
+    expect(cursor).toBeNull();
+  });
   it('sends the first message of a verified new thread before its project assignment is persisted, including reasoning effort', async () => {
     const created = await app.inject({ method: 'POST', url: '/api/threads', headers: { ...headers, cookie }, payload: { projectId, model: 'synthetic-model', effort: 'high' } });
     expect(created.statusCode).toBe(200);
@@ -338,6 +466,134 @@ describe('private HTTP boundary and project access', () => {
     const sent = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/messages', headers: { ...headers, cookie }, payload: { projectId, text: 'Synthetic message', requestId: 'synthetic-inherit-request', ...injected } });
     expect(sent.statusCode).toBe(200);
     expect(bridge.startTurn).toHaveBeenCalledWith('synthetic-thread', { input: [{ type: 'text', text: 'Synthetic message', text_elements: [] }] }, 'synthetic-inherit-request');
+  });
+  it('syncs the local desktop reviewer for thread creation, resume and turns without forwarding other permission overrides', async () => {
+    config.codexHome = path.join(temp, 'synthetic-codex-home');
+    await mkdir(config.codexHome);
+    await writeFile(path.join(config.codexHome, '.codex-global-state.json'), JSON.stringify({
+      'electron-persisted-atom-state': { 'permission-selection-by-host-id:local': { kind: 'agent-mode', agentMode: 'guardian-approvals' } },
+    }));
+    const injected = { approvalPolicy: 'never', approvalsReviewer: 'user', sandbox: 'danger-full-access', sandboxPolicy: { type: 'dangerFullAccess' }, permissions: 'synthetic-unrequested-profile', config: { approvals_reviewer: 'user', sandbox_mode: 'danger-full-access' } };
+    const created = await app.inject({ method: 'POST', url: '/api/threads', headers: { ...headers, cookie }, payload: { projectId, model: 'synthetic-model', effort: 'high', ...injected } });
+    expect(created.statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/start', { projectId, cwd: bridge.cwd, model: 'synthetic-model', config: { model_reasoning_effort: 'high' }, approvalsReviewer: 'auto_review' });
+    const resumed = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId, ...injected } });
+    expect(resumed.statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true, approvalsReviewer: 'auto_review' });
+    const sent = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/messages', headers: { ...headers, cookie }, payload: { projectId, text: 'Synthetic reviewer message', model: 'synthetic-model', effort: 'high', requestId: 'synthetic-review-request', ...injected } });
+    expect(sent.statusCode).toBe(200);
+    expect(bridge.startTurn).toHaveBeenCalledWith('synthetic-thread', { input: [{ type: 'text', text: 'Synthetic reviewer message', text_elements: [] }], model: 'synthetic-model', effort: 'high' }, 'synthetic-review-request', 'auto_review');
+  });
+  it('rereads desktop preferences between operations and omits unknown or custom review selections', async () => {
+    config.codexHome = path.join(temp, 'synthetic-codex-home');
+    await mkdir(config.codexHome);
+    const statePath = path.join(config.codexHome, '.codex-global-state.json');
+    await writeFile(statePath, JSON.stringify({
+      'electron-persisted-atom-state': { 'permission-selection-by-host-id:local': { kind: 'agent-mode', agentMode: 'guardian-approvals' } },
+    }));
+    expect((await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId } })).statusCode).toBe(200);
+    expect(bridge.request).toHaveBeenCalledWith('thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true, approvalsReviewer: 'auto_review' });
+    for (const selection of [{ kind: 'agent-mode', agentMode: 'synthetic-future-mode' }, { kind: 'custom' }]) {
+      await writeFile(statePath, JSON.stringify({
+        'electron-persisted-atom-state': { 'permission-selection-by-host-id:local': selection, 'agent-mode-by-host-id': { local: 'guardian-approvals' } },
+      }));
+      bridge.request.mockClear();
+      expect((await app.inject({ method: 'POST', url: '/api/threads', headers: { ...headers, cookie }, payload: { projectId } })).statusCode).toBe(200);
+      expect(bridge.request).toHaveBeenCalledWith('thread/start', { projectId, cwd: bridge.cwd });
+      expect((await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId } })).statusCode).toBe(200);
+      expect(bridge.request).toHaveBeenCalledWith('thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true });
+      bridge.startTurn.mockClear();
+      expect((await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/messages', headers: { ...headers, cookie }, payload: { projectId, text: 'Synthetic preference update', requestId: 'synthetic-preference-request' } })).statusCode).toBe(200);
+      expect(bridge.startTurn).toHaveBeenCalledWith('synthetic-thread', { input: [{ type: 'text', text: 'Synthetic preference update', text_elements: [] }] }, 'synthetic-preference-request');
+    }
+  });
+  it('propagates native reviewer policy rejection without retrying with different authorization or starting work', async () => {
+    config.codexHome = path.join(temp, 'synthetic-codex-home');
+    await mkdir(config.codexHome);
+    await writeFile(path.join(config.codexHome, '.codex-global-state.json'), JSON.stringify({
+      'electron-persisted-atom-state': { 'permission-selection-by-host-id:local': { kind: 'agent-mode', agentMode: 'guardian-approvals' } },
+    }));
+    const originalRequest = bridge.request.getMockImplementation()!;
+    bridge.request.mockImplementation(async (method, rpcParams) => {
+      if (method === 'thread/resume') throw new Error('CODEX_RPC_ERROR');
+      return originalRequest(method, rpcParams);
+    });
+    const resumed = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId } });
+    expect(resumed.statusCode).toBe(500);
+    expect(resumed.json()).toEqual({ error: 'CODEX_RPC_ERROR' });
+    expect(bridge.request.mock.calls.filter(([method]) => method === 'thread/resume')).toEqual([
+      ['thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true, approvalsReviewer: 'auto_review' }],
+    ]);
+    expect(bridge.request.mock.calls.some(([method]) => method === 'thread/start')).toBe(false);
+    expect(bridge.startTurn).not.toHaveBeenCalled();
+  });
+  it('updates a loaded thread whose resume ignores the reviewer and returns verified native settings', async () => {
+    config.codexHome = path.join(temp, 'synthetic-codex-home');
+    await mkdir(config.codexHome);
+    await writeFile(path.join(config.codexHome, '.codex-global-state.json'), JSON.stringify({
+      'electron-persisted-atom-state': { 'permission-selection-by-host-id:local': { kind: 'agent-mode', agentMode: 'guardian-approvals' } },
+    }));
+    const native = { thread: { id: 'synthetic-thread', projectId, cwd: bridge.cwd, turns: [] }, approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: 'workspaceWrite', writableRoots: [bridge.cwd], networkAccess: false }, activePermissionProfile: { id: 'synthetic-managed-profile', extends: null }, model: 'synthetic-model', reasoningEffort: 'high' };
+    let reviewer = 'user';
+    const originalRequest = bridge.request.getMockImplementation()!;
+    bridge.request.mockImplementation(async (method, rpcParams) => {
+      if (method === 'thread/resume') return { ...native, approvalsReviewer: reviewer };
+      if (method === 'thread/settings/update') { reviewer = rpcParams.approvalsReviewer; return {}; }
+      return originalRequest(method, rpcParams);
+    });
+    const resumed = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId } });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.json()).toEqual({ ...native, approvalsReviewer: 'auto_review' });
+    expect(bridge.request.mock.calls.filter(([method]) => method !== 'thread/read')).toEqual([
+      ['thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true, approvalsReviewer: 'auto_review' }],
+      ['thread/settings/update', { threadId: 'synthetic-thread', approvalsReviewer: 'auto_review' }],
+      ['thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true }],
+    ]);
+    expect(bridge.startTurn).not.toHaveBeenCalled();
+    bridge.request.mockClear();
+    expect((await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId } })).statusCode).toBe(200);
+    expect(bridge.request.mock.calls.filter(([method]) => method !== 'thread/read')).toEqual([
+      ['thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true, approvalsReviewer: 'auto_review' }],
+    ]);
+  });
+  it('preserves native rejection when updating a loaded thread reviewer without starting work or retrying', async () => {
+    config.codexHome = path.join(temp, 'synthetic-codex-home');
+    await mkdir(config.codexHome);
+    await writeFile(path.join(config.codexHome, '.codex-global-state.json'), JSON.stringify({
+      'electron-persisted-atom-state': { 'permission-selection-by-host-id:local': { kind: 'agent-mode', agentMode: 'guardian-approvals' } },
+    }));
+    const originalRequest = bridge.request.getMockImplementation()!;
+    bridge.request.mockImplementation(async (method, rpcParams) => {
+      if (method === 'thread/resume') return { approvalsReviewer: 'user' };
+      if (method === 'thread/settings/update') throw new Error('CODEX_RPC_ERROR');
+      return originalRequest(method, rpcParams);
+    });
+    const resumed = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId } });
+    expect(resumed.statusCode).toBe(500);
+    expect(resumed.json()).toEqual({ error: 'CODEX_RPC_ERROR' });
+    expect(bridge.request.mock.calls.filter(([method]) => method !== 'thread/read')).toEqual([
+      ['thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true, approvalsReviewer: 'auto_review' }],
+      ['thread/settings/update', { threadId: 'synthetic-thread', approvalsReviewer: 'auto_review' }],
+    ]);
+    expect(bridge.startTurn).not.toHaveBeenCalled();
+  });
+  it('reports an unconfirmed desktop reviewer instead of claiming the loaded thread was synchronized', async () => {
+    config.codexHome = path.join(temp, 'synthetic-codex-home');
+    await mkdir(config.codexHome);
+    await writeFile(path.join(config.codexHome, '.codex-global-state.json'), JSON.stringify({
+      'electron-persisted-atom-state': { 'permission-selection-by-host-id:local': { kind: 'agent-mode', agentMode: 'guardian-approvals' } },
+    }));
+    const originalRequest = bridge.request.getMockImplementation()!;
+    bridge.request.mockImplementation(async (method, rpcParams) => method === 'thread/resume' ? { approvalsReviewer: 'user' } : originalRequest(method, rpcParams));
+    const resumed = await app.inject({ method: 'POST', url: '/api/threads/synthetic-thread/resume', headers: { ...headers, cookie }, payload: { projectId } });
+    expect(resumed.statusCode).toBe(409);
+    expect(resumed.json()).toEqual({ error: 'DESKTOP_REVIEWER_NOT_APPLIED' });
+    expect(bridge.request.mock.calls.filter(([method]) => method !== 'thread/read')).toEqual([
+      ['thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true, approvalsReviewer: 'auto_review' }],
+      ['thread/settings/update', { threadId: 'synthetic-thread', approvalsReviewer: 'auto_review' }],
+      ['thread/resume', { threadId: 'synthetic-thread', cwd: bridge.cwd, excludeTurns: true }],
+    ]);
+    expect(bridge.startTurn).not.toHaveBeenCalled();
   });
   it('rejects unsupported reasoning effort before creating a thread or dispatching a turn', async () => {
     for (const effort of ['unsupported', false, 5]) {
@@ -429,5 +685,23 @@ describe('private HTTP boundary and project access', () => {
     expect(bridge.interrupt).not.toHaveBeenCalled();
     expect(bridge.listenerCount('event')).toBe(0);
     await expect(app.injectWS('/api/events', { headers: { ...headers, origin: 'http://attacker.invalid', cookie } })).rejects.toThrow();
+  });
+  it('closes a half-open event stream and detaches its listener without interrupting the turn', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const ws = await app.injectWS('/api/events?after=0', { headers: { ...headers, cookie } });
+    try {
+      const serverSocket = [...app.websocketServer.clients][0];
+      // Simulate a lost network path: no ping reaches the browser, so no pong returns.
+      const ping = vi.spyOn(serverSocket, 'ping').mockImplementation(() => undefined);
+      const heartbeat = once(ws, 'message');
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(JSON.parse((await heartbeat)[0].toString())).toEqual({ seq: 0, method: 'pocketagent/heartbeat', params: {} });
+      expect(ping).toHaveBeenCalledOnce();
+      const closed = once(ws, 'close');
+      await vi.advanceTimersByTimeAsync(15_000);
+      await closed;
+      expect(bridge.listenerCount('event')).toBe(0);
+      expect(bridge.interrupt).not.toHaveBeenCalled();
+    } finally { ws.terminate(); vi.useRealTimers(); }
   });
 });

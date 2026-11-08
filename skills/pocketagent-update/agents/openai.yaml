@@ -1,0 +1,4 @@
+interface:
+  display_name: "PocketAgent Update"
+  short_description: "Deploy PocketAgent with isolated activation and rollback"
+  default_prompt: "Use $pocketagent-update to verify the changes and safely update the PocketAgent service."

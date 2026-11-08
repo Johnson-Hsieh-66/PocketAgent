@@ -12,6 +12,7 @@ export interface AppConfig {
   codexHome?: string;
   staticDir?: string;
   checkoutDir: string;
+  releaseId?: string;
 }
 
 function ipv4Parts(host: string): number[] | null {
@@ -54,13 +55,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     if (parent === checkoutDir) throw new Error('CHECKOUT_NOT_FOUND');
     checkoutDir = parent;
   }
+  const applicationDir = checkoutDir;
+  if (env.POCKETAGENT_CHECKOUT_DIR) {
+    const original = realpathSync(path.resolve(env.POCKETAGENT_CHECKOUT_DIR));
+    if (JSON.parse(readFileSync(path.join(original, 'package.json'), 'utf8')).name !== 'pocketagent') throw new Error('CHECKOUT_NOT_FOUND');
+    checkoutDir = original;
+  }
   const localBase = env.LOCALAPPDATA || path.join(os.homedir(), '.local', 'share');
   let dataDir = path.resolve(env.POCKETAGENT_DATA_DIR || path.join(localBase, 'PocketAgent'));
-  if (isWithin(checkoutDir, dataDir)) throw new Error('RUNTIME_DIRECTORY_INSIDE_CHECKOUT');
+  if (isWithin(checkoutDir, dataDir) || isWithin(applicationDir, dataDir)) throw new Error('RUNTIME_DIRECTORY_INSIDE_CHECKOUT');
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   dataDir = realpathSync(dataDir);
   checkoutDir = realpathSync(checkoutDir);
-  if (isWithin(checkoutDir, dataDir)) throw new Error('RUNTIME_DIRECTORY_INSIDE_CHECKOUT');
+  if (isWithin(checkoutDir, dataDir) || isWithin(realpathSync(applicationDir), dataDir)) throw new Error('RUNTIME_DIRECTORY_INSIDE_CHECKOUT');
   const configPath = path.join(dataDir, 'config.json');
   if (!existsSync(configPath)) {
     writeFileSync(configPath, JSON.stringify({ host: 'private', port: 47831 }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
@@ -73,5 +80,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (saved.projectRoots !== undefined && (!Array.isArray(saved.projectRoots) || saved.projectRoots.some(root => typeof root !== 'string' || !path.isAbsolute(root)))) throw new Error('INVALID_PROJECT_ROOTS');
   const projectRoots = saved.projectRoots === undefined ? [] : saved.projectRoots as string[];
   const codexPath = env.POCKETAGENT_CODEX_PATH || (typeof saved.codexPath === 'string' ? saved.codexPath : undefined);
-  return { host, port, dataDir, checkoutDir, projectRoots, codexPath, codexHome: path.resolve(env.CODEX_HOME || path.join(os.homedir(), '.codex')), staticDir: path.join(checkoutDir, 'dist', 'client') };
+  const releaseId = env.POCKETAGENT_RELEASE_ID;
+  if (releaseId !== undefined && !/^[a-zA-Z0-9_-]{1,80}$/.test(releaseId)) throw new Error('INVALID_RELEASE_ID');
+  return { host, port, dataDir, checkoutDir, projectRoots, codexPath, codexHome: path.resolve(env.CODEX_HOME || path.join(os.homedir(), '.codex')), staticDir: path.join(applicationDir, 'dist', 'client'), ...(releaseId ? { releaseId } : {}) };
 }

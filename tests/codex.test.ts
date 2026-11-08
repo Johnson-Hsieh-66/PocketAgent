@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { CodexBridge, type SubmissionLedger } from '../src/server/codex.js';
 import type { AppEvent } from '../src/shared/types.js';
 import type { DiagnosticSink } from '../src/server/diagnostics.js';
@@ -10,8 +11,8 @@ const fixture = resolve('tests/fixtures/fake-codex.mjs');
 const bridges: CodexBridge[] = [];
 const directories: string[] = [];
 const input = (text = 'hold') => ({ input: [{ type: 'text', text }] });
-async function start(path = fixture, ledger?: SubmissionLedger, diagnostic?: DiagnosticSink) {
-  const bridge = new CodexBridge({ command: process.execPath, args: [path] }, ledger, diagnostic);
+async function start(path = fixture, ledger?: SubmissionLedger, diagnostic?: DiagnosticSink, extraArgs: string[] = []) {
+  const bridge = new CodexBridge({ command: process.execPath, args: [path, ...extraArgs] }, ledger, diagnostic);
   bridges.push(bridge);
   await bridge.start();
   return bridge;
@@ -29,6 +30,7 @@ function hasEvent(bridge: CodexBridge, method: string, threadId?: string) {
   return bridge.eventsSince(0).events.some(event => event.method === method && (!threadId || event.params.threadId === threadId));
 }
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(bridges.splice(0).map(bridge => bridge.stop()));
   for (const directory of directories.splice(0)) {
     const destination = resolve(directory);
@@ -43,6 +45,26 @@ describe('Codex stdio bridge with a synthetic child', () => {
   it('leaves approval and permission configuration to Codex when launching app-server', async () => {
     const bridge = await start();
     expect((await bridge.request('fixture/stats')).launchArgs).toEqual(['app-server', '--listen', 'stdio://']);
+  });
+  it('syncs reviewer settings without changing message deduplication when desktop preferences change', async () => {
+    const { ledger } = memoryLedger();
+    const bridge = await start(fixture, ledger);
+    const request = vi.spyOn(bridge, 'request');
+    const message = input();
+    const first = bridge.startTurn('review-thread', message, 'review-submission', 'auto_review');
+    expect(bridge.startTurn('review-thread', message, 'review-submission', 'user')).toBe(first);
+    await first;
+    expect(request.mock.calls.filter(([method]) => method === 'turn/start')).toEqual([
+      ['turn/start', { ...message, threadId: 'review-thread', approvalsReviewer: 'auto_review' }],
+    ]);
+    expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 1 });
+    await bridge.request('fixture/complete', { threadId: 'review-thread' });
+    await bridge.startTurn('review-thread', message, 'next-review-submission', 'user');
+    expect(request).toHaveBeenLastCalledWith('turn/start', { ...message, threadId: 'review-thread', approvalsReviewer: 'user' });
+    await bridge.stop();
+    const restarted = await start(fixture, ledger);
+    await expect(restarted.startTurn('review-thread', message, 'review-submission', 'user')).rejects.toThrow('REQUEST_ALREADY_SUBMITTED');
+    expect(await restarted.request('fixture/stats')).toMatchObject({ starts: 0 });
   });
   it('remembers only verified project assignments from its own live thread starts and clears them on stop', async () => {
     const bridge = await start();
@@ -151,6 +173,121 @@ describe('Codex stdio bridge with a synthetic child', () => {
     expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 0 });
   });
 
+  it('deduplicates recovery, stops all owned work and reconnects without replaying submissions', async () => {
+    const { ledger, entries } = memoryLedger();
+    const bridge = await start(fixture, ledger, undefined, ['--fixture-delay-exit']);
+    await bridge.request('thread/start', { projectId: 'synthetic-project', cwd: '/synthetic/project' });
+    await bridge.startTurn('recovery-approval-thread', input('approval'), 'recovery-approval-request');
+    const ambiguous = bridge.startTurn('recovery-pending-thread', input('deferred-start-response'), 'recovery-pending-request');
+    const rejected = expect(ambiguous).rejects.toThrow('STOPPED');
+    await bridge.request('fixture/stats');
+    expect(bridge.pendingRequests).toHaveLength(1);
+    const recovery = bridge.recover();
+    expect(bridge.recover()).toBe(recovery);
+    expect(bridge.start()).toBe(recovery);
+    await expect(bridge.startTurn('blocked-thread', input(), 'blocked-during-recovery')).rejects.toThrow('CODEX_OFFLINE');
+    await expect(bridge.request('fixture/stats')).rejects.toThrow('CODEX_OFFLINE');
+    expect(entries.has('blocked-during-recovery')).toBe(false);
+    await recovery;
+    await rejected;
+    expect(bridge.status).toMatchObject({ codex: 'ready', authenticated: true });
+    expect(bridge.pendingRequests).toEqual([]);
+    expect(bridge.createdThreadIds('synthetic-project')).toEqual([]);
+    expect(hasEvent(bridge, 'pocketagent/interrupted', 'recovery-approval-thread')).toBe(true);
+    expect(hasEvent(bridge, 'pocketagent/interrupted', 'recovery-pending-thread')).toBe(true);
+    expect(await bridge.request('fixture/stats')).toMatchObject({ initializes: 1, starts: 0, active: [], approvals: 0 });
+    await bridge.startTurn('recovery-approval-thread', input('approval'), 'recovery-approval-request');
+    await expect(bridge.startTurn('recovery-pending-thread', input('deferred-start-response'), 'recovery-pending-request')).rejects.toThrow('STOPPED');
+    expect(entries.has('recovery-pending-request')).toBe(true);
+    expect(await bridge.request('fixture/stats')).toHaveProperty('starts', 0);
+    await expect(bridge.startTurn('recovery-approval-thread', input(), 'after-recovery-request')).resolves.toHaveProperty('turn.id');
+  });
+
+  it('serializes concurrent starts and stops without admitting work or claiming submissions during shutdown', async () => {
+    const { ledger, entries } = memoryLedger();
+    const bridge = new CodexBridge({ command: process.execPath, args: [fixture, '--fixture-delay-exit'] }, ledger);
+    bridges.push(bridge);
+    const starting = bridge.start();
+    expect(bridge.start()).toBe(starting);
+    await starting;
+    const stopping = bridge.stop();
+    expect(bridge.stop()).toBe(stopping);
+    await expect(bridge.start()).rejects.toThrow('CODEX_OFFLINE');
+    await expect(bridge.startTurn('stopping-thread', input(), 'stopping-request')).rejects.toThrow('CODEX_OFFLINE');
+    expect(entries.has('stopping-request')).toBe(false);
+    await stopping;
+    expect(bridge.status.codex).toBe('offline');
+    await bridge.start();
+    expect(await bridge.request('fixture/stats')).toMatchObject({ initializes: 1, starts: 0 });
+  });
+
+  it('ignores retired child exit and error callbacks after a replacement becomes ready', async () => {
+    const bridge = await start();
+    const retired = (bridge as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    await bridge.recover();
+    retired.emit('exit', 99, null);
+    retired.emit('error', new Error('Synthetic retired child callback'));
+    expect(bridge.status).toMatchObject({ codex: 'ready', authenticated: true });
+    expect(await bridge.request('fixture/stats')).toMatchObject({ initializes: 1, starts: 0 });
+  });
+
+  it('lets a later service shutdown cancel recovery before it launches a replacement', async () => {
+    const bridge = await start(fixture, undefined, undefined, ['--fixture-delay-exit']);
+    const recovery = expect(bridge.recover()).rejects.toThrow('CODEX_RECOVERY_FAILED');
+    const stopped = bridge.stop();
+    await Promise.all([recovery, stopped]);
+    expect(bridge.status.codex).toBe('offline');
+    await expect(bridge.request('fixture/stats')).rejects.toThrow('CODEX_OFFLINE');
+    await bridge.start();
+    expect(await bridge.request('fixture/stats')).toMatchObject({ initializes: 1, starts: 0 });
+  });
+
+  it('keeps the old child owned and refuses a second writer when its exit cannot be confirmed', async () => {
+    const bridge = await start();
+    const internal = bridge as unknown as {
+      child: ChildProcessWithoutNullStreams;
+      waitForExit(child: ChildProcessWithoutNullStreams, milliseconds: number): Promise<boolean>;
+      killOwnedTree(child: ChildProcessWithoutNullStreams): Promise<void>;
+    };
+    const child = internal.child;
+    const end = vi.spyOn(child.stdin, 'end').mockImplementation(() => child.stdin);
+    const wait = vi.spyOn(internal, 'waitForExit').mockResolvedValue(false);
+    const kill = vi.spyOn(internal, 'killOwnedTree').mockResolvedValue(undefined);
+    try {
+      await expect(bridge.recover()).rejects.toThrow('CODEX_STOP_FAILED');
+      expect(bridge.status).toMatchObject({ codex: 'offline', error: 'CODEX_STOP_FAILED' });
+      expect(internal.child).toBe(child);
+      expect(child.exitCode).toBeNull();
+      await expect(bridge.start()).rejects.toThrow('CODEX_OFFLINE');
+      await expect(bridge.startTurn('unconfirmed-thread', input(), 'unconfirmed-request')).rejects.toThrow('CODEX_OFFLINE');
+    } finally { end.mockRestore(); wait.mockRestore(); kill.mockRestore(); }
+    await bridge.stop();
+  });
+
+  it('terminates its synthetic child when EOF is ignored and waits for confirmed exit before recovery', async () => {
+    const bridge = await start(fixture, undefined, undefined, ['--fixture-ignore-eof']);
+    const internal = bridge as unknown as { child: ChildProcessWithoutNullStreams; killOwnedTree(child: ChildProcessWithoutNullStreams): Promise<void> };
+    const retired = internal.child;
+    // This fixture has no descendants. The Windows test sandbox disallows
+    // taskkill's process enumeration, so use its already-owned process handle.
+    const force = process.platform === 'win32' ? vi.spyOn(internal, 'killOwnedTree').mockImplementation(async child => { child.kill(); }) : undefined;
+    try {
+      await bridge.recover();
+      expect(retired.exitCode !== null || retired.signalCode !== null).toBe(true);
+      expect(bridge.status.codex).toBe('ready');
+      expect(await bridge.request('fixture/stats')).toMatchObject({ initializes: 1, starts: 0 });
+    } finally { await bridge.stop(); force?.mockRestore(); }
+  }, 15_000);
+
+  it.skipIf(process.platform === 'win32' && process.env.POCKETAGENT_TEST_PROCESS_TREE !== '1')('terminates its owned process tree before replacing an EOF-ignoring synthetic child', async () => {
+    const bridge = await start(fixture, undefined, undefined, ['--fixture-ignore-eof']);
+    const retired = (bridge as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    await bridge.recover();
+    expect(retired.exitCode !== null || retired.signalCode !== null).toBe(true);
+    expect(bridge.status.codex).toBe('ready');
+    expect(await bridge.request('fixture/stats')).toMatchObject({ initializes: 1, starts: 0 });
+  }, 15_000);
+
   it('retains only a fingerprint and prevents duplicate submission across bridge instances', async () => {
     const { ledger, entries } = memoryLedger();
     const firstBridge = await start(fixture, ledger);
@@ -210,6 +347,83 @@ describe('Codex stdio bridge with a synthetic child', () => {
     await bridge.startTurn('quick-thread', input('complete-before-response'), 'quick-request');
     await expect(bridge.startTurn('quick-thread', input(), 'after-quick-request')).resolves.toHaveProperty('turn.id');
     expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 2 });
+  });
+
+  it('does not let an old turn/start reply replace the lock of a newer turn', async () => {
+    const bridge = await start();
+    let replacement: Promise<any> | undefined;
+    const onEvent = (event: AppEvent) => {
+      if (event.method === 'turn/completed' && event.params.threadId === 'fast-followup-thread' && !replacement) {
+        replacement = bridge.startTurn('fast-followup-thread', input(), 'fast-followup-request');
+      }
+    };
+    bridge.on('event', onEvent);
+    try {
+      await bridge.startTurn('fast-followup-thread', input('complete-before-next-response'), 'fast-original-request');
+      expect(replacement).toBeDefined();
+      await replacement;
+      await bridge.interrupt('fast-followup-thread');
+      expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 2, active: [] });
+    } finally { bridge.off('event', onEvent); }
+  });
+
+  it.each(['fixture/close-thread', 'fixture/complete', 'fixture/idle-thread'])('invalidates a pending start on %s before adopting another active turn', async lifecycle => {
+    const bridge = await start();
+    const pending = bridge.startTurn('reopened-thread', input('deferred-start-response'), 'reopened-request');
+    expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 1, active: ['reopened-thread'] });
+    await bridge.request(lifecycle, { threadId: 'reopened-thread' });
+    // Reopening can adopt a turn whose ID is unavailable until turns/list.
+    await bridge.request('thread/read', { threadId: 'reopened-thread' });
+    await bridge.request('fixture/reply-start', { threadId: 'reopened-thread' });
+    await pending;
+    await bridge.interrupt('reopened-thread');
+    expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 1, active: [] });
+  });
+
+  it('releases only the closed thread and its pending approvals without waiting for turn/completed', async () => {
+    const bridge = await start();
+    await bridge.startTurn('closed-thread', input('approval'), 'closed-request');
+    await bridge.startTurn('other-approval-thread', input('approval'), 'other-approval-request');
+    await vi.waitFor(() => expect(bridge.pendingRequests).toHaveLength(2));
+    await bridge.request('fixture/close-thread', { threadId: 'closed-thread' });
+    expect(bridge.pendingRequests).toEqual([expect.objectContaining({ params: expect.objectContaining({ threadId: 'other-approval-thread' }) })]);
+    expect(hasEvent(bridge, 'pocketagent/interrupted', 'closed-thread')).toBe(true);
+    await expect(bridge.startTurn('other-approval-thread', input(), 'other-busy-request')).rejects.toThrow('THREAD_BUSY');
+    await expect(bridge.startTurn('closed-thread', input(), 'after-close-request')).resolves.toHaveProperty('turn.id');
+  });
+
+  it('can find and interrupt an unacknowledged running turn instead of trapping it in starting', async () => {
+    const { ledger, entries } = memoryLedger();
+    const bridge = await start(fixture, ledger);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const result = expect(bridge.startTurn('unacknowledged-thread', input('unacknowledged-active'), 'unacknowledged-request')).rejects.toThrow('CODEX_REQUEST_TIMEOUT');
+    expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 1, active: ['unacknowledged-thread'] });
+    await vi.advanceTimersByTimeAsync(45_000);
+    await result;
+    vi.useRealTimers();
+    await bridge.interrupt('unacknowledged-thread');
+    await expect(bridge.startTurn('unacknowledged-thread', input(), 'after-unacknowledged-request')).resolves.toHaveProperty('turn.id');
+    expect(entries.has('unacknowledged-request')).toBe(true);
+    await expect(bridge.startTurn('unacknowledged-thread', input('unacknowledged-active'), 'unacknowledged-request')).rejects.toThrow('CODEX_REQUEST_TIMEOUT');
+    expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 2 });
+  });
+
+  it('clears a timed-out start only after an idle snapshot and never replays the ambiguous submission', async () => {
+    const { ledger, entries } = memoryLedger();
+    const bridge = await start(fixture, ledger);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const result = expect(bridge.startTurn('idle-timeout-thread', input('unacknowledged-idle'), 'idle-timeout-request')).rejects.toThrow('CODEX_REQUEST_TIMEOUT');
+    await bridge.request('thread/read', { threadId: 'idle-timeout-thread', fixtureReadCurrent: true });
+    // An idle read while turn/start is still pending cannot release its claim.
+    await expect(bridge.startTurn('idle-timeout-thread', input(), 'premature-request')).rejects.toThrow('THREAD_BUSY');
+    await vi.advanceTimersByTimeAsync(45_000);
+    await result;
+    vi.useRealTimers();
+    await bridge.request('thread/read', { threadId: 'idle-timeout-thread', fixtureReadCurrent: true });
+    await expect(bridge.startTurn('idle-timeout-thread', input(), 'recovered-request')).resolves.toHaveProperty('turn.id');
+    expect(entries.has('idle-timeout-request')).toBe(true);
+    await expect(bridge.startTurn('idle-timeout-thread', input('unacknowledged-idle'), 'idle-timeout-request')).rejects.toThrow('CODEX_REQUEST_TIMEOUT');
+    expect(await bridge.request('fixture/stats')).toMatchObject({ starts: 1 });
   });
 
   it('limits replay and signals when a reconnect cursor is stale or invalid', () => {

@@ -4,6 +4,7 @@ import { createInterface } from 'node:readline';
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const active = new Map();
 const approvals = new Map();
+const deferredStarts = new Map();
 let starts = 0;
 let initializes = 0;
 const send = message => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -48,6 +49,10 @@ lines.on('line', line => {
         break;
       }
       const threadId = params.threadId;
+      if (params.fixtureReadCurrent) {
+        respond(id, { thread: { id: threadId, status: { type: active.has(threadId) ? 'active' : 'idle' }, turns: [] } });
+        break;
+      }
       const turn = { id: 'fixture-resumed-turn', status: 'inProgress', items: [] };
       active.set(threadId, turn);
       // A resumed thread can already be active without a new turn/started notification.
@@ -70,6 +75,26 @@ lines.on('line', line => {
       complete(params.threadId);
       respond(id, {});
       break;
+    case 'fixture/close-thread':
+      active.delete(params.threadId);
+      for (const [id, request] of approvals) if (request.threadId === params.threadId) approvals.delete(id);
+      notify('thread/closed', { threadId: params.threadId });
+      respond(id, {});
+      break;
+    case 'fixture/idle-thread':
+      active.delete(params.threadId);
+      notify('thread/status/changed', { threadId: params.threadId, status: { type: 'idle' } });
+      respond(id, {});
+      break;
+    case 'fixture/reply-start': {
+      const deferred = deferredStarts.get(params.threadId);
+      if (deferred) {
+        deferredStarts.delete(params.threadId);
+        respond(deferred.id, { turn: deferred.turn });
+      }
+      respond(id, {});
+      break;
+    }
     case 'fixture/crash':
       process.exit(17);
       break;
@@ -84,14 +109,26 @@ lines.on('line', line => {
         break;
       }
       if (mode === 'crash-during-start') process.exit(19);
+      if (mode === 'unacknowledged-idle') break;
       const turn = { id: `fixture-turn-${++starts}`, status: 'inProgress', items: [] };
       active.set(params.threadId, turn);
+      if (mode === 'unacknowledged-active') break;
       notify('turn/started', { threadId: params.threadId, turn });
-      if (mode === 'complete-before-response') {
+      if (mode === 'deferred-start-response') {
+        deferredStarts.set(params.threadId, { id, turn });
+      } else if (mode === 'complete-before-next-response') {
+        complete(params.threadId);
+        deferredStarts.set(params.threadId, { id, turn });
+      } else if (mode === 'complete-before-response') {
         complete(params.threadId);
         setTimeout(() => respond(id, { turn }), 10);
       } else {
         respond(id, { turn });
+        const deferred = deferredStarts.get(params.threadId);
+        if (deferred) {
+          deferredStarts.delete(params.threadId);
+          respond(deferred.id, { turn: deferred.turn });
+        }
         if (mode === 'approval') {
           const approvalId = `fixture-approval-${starts}`;
           approvals.set(approvalId, { threadId: params.threadId });
@@ -118,4 +155,11 @@ lines.on('line', line => {
       send({ id, error: { code: -32601, message: 'Unknown synthetic method' } });
   }
 });
-lines.on('close', () => process.exit(0));
+lines.on('close', () => {
+  if (process.argv.includes('--fixture-ignore-eof')) {
+    setInterval(() => {}, 1000);
+    setTimeout(() => process.exit(0), 15_000);
+  }
+  else if (process.argv.includes('--fixture-delay-exit')) setTimeout(() => process.exit(0), 80);
+  else process.exit(0);
+});

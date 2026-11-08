@@ -11,21 +11,24 @@ import { Store } from './store.js';
 import { Files, HttpError } from './files.js';
 import { accessState, authenticate, checkBoundary, COOKIE_NAME, COOKIE_OPTIONS, tokenAuthorized, validateRequestResult } from './auth.js';
 import { safeDiagnosticCode, sanitizeDiagnostic, type DiagnosticSink } from './diagnostics.js';
+import { readDesktopReviewSelection } from './desktop-review.js';
+import type { ApprovalsReviewer } from '../../.generated/codex/v2/ApprovalsReviewer.js';
 
 export interface HttpBridge {
   status: ServiceStatus;
   pendingRequests: PendingRequest[];
-  eventsSince(seq: number): { events: AppEvent[]; reset: boolean };
+  eventsSince(seq: number, generation?: string): { events: AppEvent[]; reset: boolean };
   on(event: 'event', handler: (event: AppEvent) => void): unknown;
   off(event: 'event', handler: (event: AppEvent) => void): unknown;
   request(method: string, params?: any): Promise<any>;
-  respond(id: string | number, result: any): void;
-  startTurn(threadId: string, params: any, requestId: string): Promise<any>;
+  respond(id: string | number, result: any): void | Promise<void>;
+  startTurn(threadId: string, params: any, requestId: string, approvalsReviewer?: ApprovalsReviewer): Promise<any>;
   interrupt(threadId: string): Promise<any>;
+  recover?(): Promise<void>;
   createdThreadProject?(threadId: string): string | undefined;
   createdThreadIds?(projectId: string): string[];
 }
-interface AppOptions { config: AppConfig; store: Store; bridge: HttpBridge; files: Files; diagnostic?: DiagnosticSink }
+interface AppOptions { config: AppConfig; store: Store; bridge: HttpBridge; files: Files; diagnostic?: DiagnosticSink; disconnectClients?: () => void }
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): ObjectValue => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, 'INVALID_INPUT');
@@ -37,8 +40,27 @@ const string = (value: unknown, max = 1000): string => {
 };
 const query = (request: FastifyRequest): ObjectValue => (request.query || {}) as ObjectValue;
 const params = (request: FastifyRequest): ObjectValue => request.params as ObjectValue;
+const pageSize = (value: unknown, fallback: number): number => {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'string' || !/^[1-9]\d?$/.test(value) || Number(value) > 20) throw new HttpError(400, 'INVALID_INPUT');
+  return Number(value);
+};
+const cursorPrefix = 'pocketagent:1:';
+function threadCursor(value: unknown, legacyIds: string[]): { native: string | null; legacy: number } {
+  if (value === undefined) return { native: null, legacy: 0 };
+  const raw = string(value, 4096);
+  // Continue accepting native cursors issued by older clients.
+  if (!raw.startsWith(cursorPrefix)) return { native: raw, legacy: legacyIds.length };
+  try {
+    const parsed = JSON.parse(Buffer.from(raw.slice(cursorPrefix.length), 'base64url').toString('utf8'));
+    if ((parsed.native !== null && (typeof parsed.native !== 'string' || !parsed.native.length || parsed.native.length > 2048)) || (parsed.after !== null && (typeof parsed.after !== 'string' || !parsed.after.length || parsed.after.length > 1000))) throw new Error();
+    // A verified draft assignment disappears when canonical metadata arrives.
+    // Anchor to identity rather than an offset so removals cannot skip sessions.
+    return { native: parsed.native, legacy: parsed.after === null ? 0 : Math.max(0, legacyIds.indexOf(parsed.after) + 1) };
+  } catch { throw new HttpError(400, 'INVALID_INPUT'); }
+}
 
-export async function buildApp({ config, store, bridge, files, diagnostic }: AppOptions): Promise<FastifyInstance> {
+export async function buildApp({ config, store, bridge, files, diagnostic, disconnectClients }: AppOptions): Promise<FastifyInstance> {
   if (config.host === 'tailscale' || config.host === 'private') throw new Error('LISTENER_HOST_NOT_RESOLVED');
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024, requestTimeout: 30_000, trustProxy: false });
   await app.register(cookie);
@@ -50,6 +72,7 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     started.set(request, performance.now());
     checkBoundary(request, config);
     reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('X-PocketAgent-Release', config.releaseId || 'checkout');
     reply.header('Referrer-Policy', 'no-referrer');
     reply.header('Cross-Origin-Resource-Policy', 'same-origin');
     reply.header('Content-Security-Policy', `default-src 'self'; script-src 'self'; connect-src 'self' ws://${config.host}:${config.port}; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`);
@@ -63,7 +86,7 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     const message = error instanceof Error ? error.message : '';
     const rawStatus = typeof error === 'object' && error !== null && 'statusCode' in error ? error.statusCode : undefined;
     const safeCode = error instanceof HttpError ? error.message : /^[A-Z][A-Z_]{2,79}$/.test(message) ? message : 'REQUEST_FAILED';
-    const statusCode = error instanceof HttpError ? error.statusCode : typeof rawStatus === 'number' && rawStatus >= 400 && rawStatus < 600 ? rawStatus : ['THREAD_BUSY', 'THREAD_WRITER_CONFLICT'].includes(safeCode) ? 409 : safeCode === 'CODEX_OFFLINE' ? 503 : 500;
+    const statusCode = error instanceof HttpError ? error.statusCode : typeof rawStatus === 'number' && rawStatus >= 400 && rawStatus < 600 ? rawStatus : ['THREAD_BUSY', 'THREAD_WRITER_CONFLICT'].includes(safeCode) ? 409 : ['CODEX_OFFLINE', 'WORKER_OFFLINE', 'WORKER_DISCONNECTED', 'WORKER_UNAVAILABLE', 'WORKER_MAINTENANCE'].includes(safeCode) ? 503 : 500;
     try {
       const rpcCode = typeof error === 'object' && error !== null && 'rpcCode' in error && typeof error.rpcCode === 'number' ? error.rpcCode : undefined;
       diagnostic?.(sanitizeDiagnostic({ component: 'http', code: safeDiagnosticCode(safeCode), operation: request.routeOptions.url,
@@ -99,6 +122,16 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     return {};
   });
   app.get('/api/status', async () => bridge.status);
+  app.post('/api/recovery', async (request, reply) => {
+    const body = object(request.body);
+    if (Object.keys(body).length !== 1 || body.confirm !== true) throw new HttpError(400, 'RECOVERY_CONFIRMATION_REQUIRED');
+    if (!bridge.recover) throw new HttpError(503, 'RECOVERY_UNAVAILABLE');
+    // Recovery must not depend on a responsive Codex RPC. The shared bridge
+    // serializes the owned process restart; clients observe progress via status.
+    void bridge.recover().catch(() => { /* The bridge reports a fixed offline status. */ });
+    disconnectClients?.();
+    return reply.code(202).send({ accepted: true });
+  });
   app.get('/api/projects', async () => ({ projects: await files.projects() }));
   app.get('/api/projects/:id/tree', async request => files.tree(string(params(request).id), typeof query(request).path === 'string' ? query(request).path as string : ''));
   app.get('/api/projects/:id/file', async request => files.read(string(params(request).id), string(query(request).path, 4000)));
@@ -131,19 +164,28 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     await files.project(projectId);
     const legacyIds = [...new Set([...(await files.threadIds(projectId)), ...(bridge.createdThreadIds?.(projectId) || [])])];
     const cursor = query(request).cursor;
-    const response = await bridge.request('thread/list', { projectId, sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'], modelProviders: [], sortKey: 'updated_at', limit: 40, ...(cursor ? { cursor: string(cursor) } : {}) });
+    const limit = pageSize(query(request).limit, 20);
+    const position = threadCursor(cursor, legacyIds);
+    const response = cursor !== undefined && position.native === null ? { data: [], nextCursor: null } : await bridge.request('thread/list', { projectId, sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'], modelProviders: [], sortKey: 'updated_at', useStateDbOnly: true, limit, ...(position.native ? { cursor: position.native } : {}) });
     const data: any[] = [];
     const seen = new Set<string>();
     for (const thread of Array.isArray(response.data) ? response.data : []) {
       if (typeof thread?.id !== 'string' || seen.has(thread.id) || (thread.projectId !== projectId && (thread.projectId || !legacyIds.includes(thread.id)))) continue;
       try { await files.assertThread(projectId, thread.cwd); data.push(thread); seen.add(thread.id); } catch { /* Filter escaped or unavailable roots. */ }
     }
-    if (!cursor) for (const id of legacyIds) {
+    // Bound legacy reads too: an old or inaccessible session cannot force a
+    // project open to read every historical rollout before showing any results.
+    let scanned = 0;
+    while (position.legacy < legacyIds.length && data.length < limit && scanned < limit) {
+      const id = legacyIds[position.legacy++];
+      scanned++;
       if (seen.has(id)) continue;
       try { const thread = await checkedThread(id, projectId); data.push(thread); seen.add(id); } catch { /* A draft or unavailable legacy thread cannot hide the remaining history. */ }
     }
     data.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
-    return { data, nextCursor: response.nextCursor || null };
+    const native = response.nextCursor || null;
+    const nextCursor = position.legacy < legacyIds.length ? cursorPrefix + Buffer.from(JSON.stringify({ native, after: legacyIds[position.legacy - 1] || null })).toString('base64url') : native;
+    return { data, nextCursor };
   });
   app.post('/api/threads', async request => {
     const body = object(request.body);
@@ -151,20 +193,32 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     if (!project.path) throw new HttpError(400, 'PROJECT_HAS_NO_LOCAL_ROOTS');
     const model = body.model === undefined ? undefined : string(body.model);
     const effort = await reasoningEffort(body.effort, model);
-    return bridge.request('thread/start', { projectId: project.id, cwd: project.path, ...(model ? { model } : {}), ...(effort ? { config: { model_reasoning_effort: effort } } : {}) });
+    return bridge.request('thread/start', { projectId: project.id, cwd: project.path, ...(model ? { model } : {}), ...(effort ? { config: { model_reasoning_effort: effort } } : {}), ...await readDesktopReviewSelection(config) });
   });
   app.get('/api/threads/:id', async request => ({ thread: await checkedThread(string(params(request).id), string(query(request).projectId)) }));
   app.get('/api/threads/:id/turns', async request => {
     const threadId = string(params(request).id);
     await checkedThread(threadId, string(query(request).projectId));
     const cursor = query(request).cursor;
-    return bridge.request('thread/turns/list', { threadId, limit: 40, itemsView: 'full', ...(cursor ? { cursor: string(cursor) } : {}) });
+    return bridge.request('thread/turns/list', { threadId, limit: pageSize(query(request).limit, 6), sortDirection: 'desc', itemsView: 'full', ...(cursor ? { cursor: string(cursor) } : {}) });
   });
   app.post('/api/threads/:id/resume', async request => {
     const body = object(request.body);
     const threadId = string(params(request).id);
     const thread = await checkedThread(threadId, string(body.projectId));
-    return bridge.request('thread/resume', { threadId, cwd: thread.cwd, excludeTurns: true });
+    const review = await readDesktopReviewSelection(config);
+    const resume = { threadId, cwd: thread.cwd, excludeTurns: true };
+    const response = await bridge.request('thread/resume', { ...resume, ...review });
+    // Native resume rejoins an already-loaded thread without applying overrides.
+    // Update that thread through the native settings API and verify its actual
+    // state, preserving all other settings and managed-policy enforcement.
+    if (review.approvalsReviewer && response.approvalsReviewer && response.approvalsReviewer !== review.approvalsReviewer) {
+      await bridge.request('thread/settings/update', { threadId, ...review });
+      const updated = await bridge.request('thread/resume', resume);
+      if (updated.approvalsReviewer !== review.approvalsReviewer) throw new HttpError(409, 'DESKTOP_REVIEWER_NOT_APPLIED');
+      return updated;
+    }
+    return response;
   });
   app.patch('/api/threads/:id', async request => {
     const body = object(request.body);
@@ -191,7 +245,9 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     if (!input.length) throw new HttpError(400, 'MESSAGE_REQUIRED');
     const requestId = string(body.requestId, 128);
     if (requestId.length < 8) throw new HttpError(400, 'INVALID_REQUEST_ID');
-    return bridge.startTurn(threadId, { input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) }, requestId);
+    const message = { input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+    const { approvalsReviewer } = await readDesktopReviewSelection(config);
+    return approvalsReviewer ? bridge.startTurn(threadId, message, requestId, approvalsReviewer) : bridge.startTurn(threadId, message, requestId);
   });
   app.post('/api/threads/:id/interrupt', async request => {
     const body = object(request.body);
@@ -219,7 +275,7 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     const pending = bridge.pendingRequests.find(item => String(item.id) === id);
     if (!pending) throw new HttpError(404, 'REQUEST_NOT_FOUND');
     const body = object(request.body);
-    bridge.respond(pending.id, validateRequestResult(pending, body.result));
+    await bridge.respond(pending.id, validateRequestResult(pending, body.result));
     return {};
   });
 
@@ -229,12 +285,14 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
       if (!tokenAuthorized(token, store)) { socket.close(4401, 'Authentication required'); return; }
       if (socket.readyState !== 1) return;
       if (socket.bufferedAmount > 1024 * 1024) { socket.close(1013, 'Reconnect to refresh'); return; }
-      socket.send(JSON.stringify(event));
+      try { socket.send(JSON.stringify(event)); } catch { socket.terminate(); }
     };
     const rawAfter = query(request).after;
     const after = rawAfter === undefined ? 0 : Number(rawAfter);
     if (!Number.isSafeInteger(after) || after < 0) { socket.close(4400, 'Invalid cursor'); return; }
-    const replay = bridge.eventsSince(after);
+    const generation = query(request).generation;
+    if (generation !== undefined && (typeof generation !== 'string' || !generation.length || generation.length > 200)) { socket.close(4400, 'Invalid generation'); return; }
+    const replay = bridge.eventsSince(after, generation as string | undefined);
     if (replay.reset) send({ seq: 0, method: 'pocketagent/reset', params: {} });
     else for (const event of replay.events) send(event);
     send({ seq: 0, method: 'pocketagent/status', params: { status: bridge.status } });
@@ -242,6 +300,16 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     bridge.on('event', send);
     const authTimer = setInterval(() => { if (!tokenAuthorized(token, store)) socket.close(4401, 'Authentication required'); }, 5000);
     authTimer.unref();
+    let alive = true;
+    socket.on('pong', () => { alive = true; });
+    const heartbeatTimer = setInterval(() => {
+      if (socket.readyState !== 1) return;
+      if (!alive) { socket.terminate(); return; }
+      alive = false;
+      send({ seq: 0, method: 'pocketagent/heartbeat', params: {} });
+      try { if (socket.readyState === 1) socket.ping(); } catch { socket.terminate(); }
+    }, 15_000);
+    heartbeatTimer.unref();
     socket.on('message', () => {
       if (!tokenAuthorized(token, store)) socket.close(4401, 'Authentication required');
       else socket.close(4400, 'Read-only event stream');
@@ -249,12 +317,17 @@ export async function buildApp({ config, store, bridge, files, diagnostic }: App
     socket.on('error', () => {
       try { diagnostic?.({ component: 'http', code: 'WEBSOCKET_ERROR', operation: '/api/events', method: 'GET' }); } catch { /* best effort */ }
     });
-    socket.on('close', () => { clearInterval(authTimer); bridge.off('event', send); });
+    socket.on('close', () => { clearInterval(authTimer); clearInterval(heartbeatTimer); bridge.off('event', send); });
   });
   if (config.staticDir && existsSync(config.staticDir)) {
-    await app.register(fastifyStatic, { root: config.staticDir, wildcard: false });
+    // Resolve assets at request time. Enumerating file routes at startup leaves
+    // new Vite hashes unreachable after a build while the service is running.
+    await app.register(fastifyStatic, { root: config.staticDir, wildcard: true, cacheControl: false,
+      setHeaders: reply => { reply.header('Cache-Control', 'no-store'); },
+    });
     app.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith('/api/')) return reply.code(404).send({ error: 'NOT_FOUND' });
+      const pathname = request.url.split('?')[0];
+      if (pathname.startsWith('/api/') || pathname.startsWith('/assets/')) return reply.code(404).send({ error: 'NOT_FOUND' });
       reply.header('Cache-Control', 'no-store');
       return reply.sendFile('index.html');
     });
